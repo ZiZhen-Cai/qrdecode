@@ -28,6 +28,17 @@ jobs:
 
       - name: Install buildozer
         run: pip install --upgrade buildozer cython
+        
+      - name: Prepare freetype cache (savannah 502 workaround)
+        run: |
+          D="$GITHUB_WORKSPACE/.buildozer/android/platform/build-arm64-v8a/packages/freetype"
+          mkdir -p "$D"
+          cd /tmp
+          curl -sL -o ft.tar.gz "https://github.com/freetype/freetype/archive/refs/tags/VER-2-14-1.tar.gz"
+          tar xzf ft.tar.gz
+          mv freetype-VER-2-14-1 freetype-2.14.1
+          tar czf "$D/freetype-2.14.1.tar.gz" freetype-2.14.1
+          touch "$D/.mark-freetype-2.14.1.tar.gz"
 
       - name: Build APK
         run: |
