@@ -22,23 +22,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git zip unzip openjdk-17-jdk \
-            autoconf libtool pkg-config zlib1g-dev libncurses5-dev \
-            libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev \
-            automake
+            autoconf automake libtool libtool-bin pkg-config gettext \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev
 
       - name: Install buildozer
         run: pip install --upgrade buildozer cython
 
-      - name: Prepare freetype cache (savannah 502 + submodule workaround)
+      - name: Prepare freetype cache (savannah 502 + submodule + configure workaround)
         run: |
           D="$GITHUB_WORKSPACE/.buildozer/android/platform/build-arm64-v8a/packages/freetype"
           mkdir -p "$D"
           cd /tmp
           git clone --depth 1 -b VER-2-14-1 --recurse-submodules \
             https://github.com/freetype/freetype.git freetype-2.14.1
+          cd freetype-2.14.1
+          sh autogen.sh
+          cd /tmp
           tar czf "$D/freetype-2.14.1.tar.gz" freetype-2.14.1
           touch "$D/.mark-freetype-2.14.1.tar.gz"
-          echo "freetype cache ready (with submodules)"
+          echo "freetype cache ready (submodules + configure)"
 
       - name: Build APK
         run: |
