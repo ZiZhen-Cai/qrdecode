@@ -11,8 +11,24 @@
 """
 import base64
 import os
+import sys
 import threading
+import types
 import zlib
+
+# zbarlight 内部 `from pkg_resources import get_distribution` 取版本号，
+# 但安卓（Python 3.14 + setuptools 新版）没有 pkg_resources，会导致 import 失败并闪退。
+# 这里在导入 zbarlight 前 mock 一个最小实现（仅需 get_distribution().version）。
+try:
+    import pkg_resources  # noqa: F401
+except ImportError:
+    _m = types.ModuleType('pkg_resources')
+
+    class _Dist(object):
+        version = '2.1'
+
+    _m.get_distribution = lambda *a, **k: _Dist()
+    sys.modules['pkg_resources'] = _m
 
 from PIL import Image
 from zbarlight import qr_code_scanner
