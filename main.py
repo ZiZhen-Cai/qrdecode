@@ -39,6 +39,31 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.progressbar import ProgressBar
 from kivy.clock import Clock
+from kivy.core.text import LabelBase
+
+
+# 修复中文乱码：Kivy 默认字体 Roboto 不含中文字形，会显示成方块。
+# 动态扫描安卓系统字体目录，找一个 CJK 字体注册为 Roboto。
+def _register_cjk_font():
+    d = '/system/fonts'
+    try:
+        names = os.listdir(d)
+    except Exception:
+        return
+    keys = ('cjk', 'misans', 'droidsansfallback', 'notosanssc', 'sourcehansans')
+    cands = [os.path.join(d, fn) for fn in names
+             if fn.lower().endswith(('.ttf', '.otf', '.ttc'))
+             and any(k in fn.lower() for k in keys)]
+    # ttf/otf 优先（ttc 字体集合 Kivy 可能不支持）
+    cands.sort(key=lambda p: (p.lower().endswith('.ttc'), p))
+    for p in cands:
+        try:
+            LabelBase.register(name='Roboto', fn_regular=p)
+            return
+        except Exception:
+            continue
+
+_register_cjk_font()
 
 
 def crc32(data):
