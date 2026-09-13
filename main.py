@@ -31,7 +31,7 @@ except ImportError:
     sys.modules['pkg_resources'] = _m
 
 from PIL import Image
-from zbarlight import qr_code_scanner
+import zbarlight
 
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
@@ -96,8 +96,11 @@ class Rebuilder(object):
 
 
 def decode_qr(pil_img):
+    """对 PIL Image 做二维码识别，返回文本或 None。"""
     try:
-        codes = qr_code_scanner(pil_img.convert('L'))
+        img = pil_img.convert('L')
+        img.load()
+        codes = zbarlight.scan_codes('qrcode', img)
     except Exception:
         return None
     if codes:
