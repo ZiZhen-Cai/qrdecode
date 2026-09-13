@@ -355,7 +355,8 @@ class RootWidget(BoxLayout):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            Clock.schedule_once(lambda dt: self._fail('读取文件失败: %s' % e))
+            msg = '读取文件失败: %s' % e
+            Clock.schedule_once(lambda dt: self._fail(msg))
             return
         if not local:
             Clock.schedule_once(lambda dt: self._fail('无法读取所选文件'))
@@ -363,7 +364,7 @@ class RootWidget(BoxLayout):
         self._decode_worker(local)
 
     def _uri_to_file(self, uri):
-        from jnius import autoclass, jarray
+        from jnius import autoclass
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
         resolver = PythonActivity.mActivity.getContentResolver()
 
@@ -386,25 +387,20 @@ class RootWidget(BoxLayout):
         os.makedirs(d, exist_ok=True)
         out = os.path.join(d, name)
 
-        # 手动流式复制。不用 Files.copy：pyjnius 对 Java 重载方法会误匹配
-        # （曾把 Path 参数错配到 OutputStream 重载，抛 TypeError）。
-        FileOutputStream = autoclass('java.io.FileOutputStream')
-        istream = resolver.openInputStream(uri)
-        fos = FileOutputStream(out)
-        buf = jarray('b')(65536)
+        # 用 ParcelFileDescriptor 拿 Linux fd，再由 Python 原生 os.read 读取。
+        # （绕开 pyjnius 的 Java 数组创建与重载方法解析问题）
+        pfd = resolver.openFileDescriptor(uri, 'r')
         try:
-            while True:
-                n = istream.read(buf, 0, 65536)
-                if n <= 0:
-                    break
-                fos.write(buf, 0, n)
+            fd = pfd.getFd()
+            with open(out, 'wb') as f:
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
         finally:
             try:
-                fos.close()
-            except Exception:
-                pass
-            try:
-                istream.close()
+                pfd.close()
             except Exception:
                 pass
         return out
@@ -431,7 +427,8 @@ class RootWidget(BoxLayout):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            Clock.schedule_once(lambda dt: self._fail(str(e)))
+            msg = str(e)
+            Clock.schedule_once(lambda dt: self._fail(msg))
 
     def _update(self, i, n):
         def _do(dt):
