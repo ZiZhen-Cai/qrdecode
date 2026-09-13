@@ -16,8 +16,6 @@ import threading
 import types
 import zlib
 
-# zbarlight 内部 `from pkg_resources import get_distribution` 取版本号，
-# 但安卓（Python 3.14 + setuptools 新版）没有 pkg_resources，会导致 import 失败并闪退。
 try:
     import pkg_resources  # noqa: F401
 except ImportError:
@@ -47,7 +45,6 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _register_fonts():
-    """优先用打包进 APK 的中文字体，其次找系统 CJK 字体。"""
     bundled = os.path.join(_HERE, 'NotoSansSC-Regular.otf')
     if os.path.exists(bundled):
         LabelBase.register(name='Roboto', fn_regular=bundled)
@@ -81,6 +78,8 @@ CLR_TEXT = get_color_from_hex('#EEF1F7')
 CLR_SUB = get_color_from_hex('#8A93A8')
 CLR_OK = get_color_from_hex('#37C08A')
 CLR_ERR = get_color_from_hex('#F2555A')
+
+_PICK_REQ = 0x5A5C
 
 
 def crc32(data):
@@ -311,27 +310,97 @@ class RootWidget(BoxLayout):
     def pick_file(self, instance):
         self._set_status('正在打开文件选择器…', CLR_SUB)
         try:
-            from plyer import filechooser
-            filechooser.open_file(on_selection=self.on_selected)
+            from android import activity as android_activity
+            from jnius import autoclass
+            Intent = autoclass('android.content.Intent')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType('*/*')
+            android_activity.bind(on_activity_result=self._on_activity_result)
+            PythonActivity.mActivity.startActivityForResult(intent, _PICK_REQ)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self._set_status('选择器打开失败: %s' % e, CLR_ERR)
 
-    def on_selected(self, selection):
-        Clock.schedule_once(lambda dt: self._handle_selection(selection))
-
-    def _handle_selection(self, selection):
-        if not selection:
-            self._set_status('未选择文件', CLR_SUB)
+    def _on_activity_result(self, request_code, result_code, intent):
+        try:
+            from android import activity as android_activity
+            android_activity.unbind(on_activity_result=self._on_activity_result)
+        except Exception:
+            pass
+        if request_code != _PICK_REQ:
             return
-        path = selection[0] if isinstance(selection, (list, tuple)) else selection
-        self._set_status('已选择: %s' % path, CLR_TEXT)
+        if result_code != -1:
+            Clock.schedule_once(lambda dt: self._set_status('已取消选择', CLR_SUB))
+            return
+        uri = intent.getData() if intent is not None else None
+        if uri is None:
+            Clock.schedule_once(lambda dt: self._set_status('未获取到文件', CLR_ERR))
+            return
+        Clock.schedule_once(lambda dt: self._handle_uri(uri))
+
+    def _handle_uri(self, uri):
+        self._set_status('正在读取文件…', CLR_TEXT)
         self.btn_pick.disabled = True
         self.progress.value = 0
-        self._thread = threading.Thread(target=self._decode_worker, args=(path,))
-        self._thread.daemon = True
-        self._thread.start()
+        t = threading.Thread(target=self._copy_and_decode, args=(uri,))
+        t.daemon = True
+        t.start()
+
+    def _copy_and_decode(self, uri):
+        try:
+            local = self._uri_to_file(uri)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            Clock.schedule_once(lambda dt: self._fail('读取文件失败: %s' % e))
+            return
+        if not local:
+            Clock.schedule_once(lambda dt: self._fail('无法读取所选文件'))
+            return
+        self._decode_worker(local)
+
+    def _uri_to_file(self, uri):
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        resolver = PythonActivity.mActivity.getContentResolver()
+
+        name = 'input.dat'
+        try:
+            cursor = resolver.query(uri, None, None, None, None)
+            if cursor is not None:
+                if cursor.moveToFirst():
+                    idx = cursor.getColumnIndex('_display_name')
+                    if idx >= 0:
+                        v = cursor.getString(idx)
+                        if v:
+                            name = v
+                cursor.close()
+        except Exception:
+            pass
+
+        name = os.path.basename(name) or 'input.dat'
+        d = self.app.user_data_dir
+        os.makedirs(d, exist_ok=True)
+        out = os.path.join(d, name)
+
+        Files = autoclass('java.nio.file.Files')
+        Paths = autoclass('java.nio.file.Paths')
+        istream = resolver.openInputStream(uri)
+        try:
+            Files.copy(istream, Paths.get(out))
+        finally:
+            try:
+                istream.close()
+            except Exception:
+                pass
+        return out
 
     def _decode_worker(self, path):
+        Clock.schedule_once(lambda dt: self._set_status(
+            '已读取，开始解码: %s' % os.path.basename(path), CLR_TEXT))
         rb = Rebuilder()
         ext = os.path.splitext(str(path))[1].lower()
         try:
