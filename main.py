@@ -43,6 +43,9 @@ from kivy.utils import get_color_from_hex
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
+_META_DURATION = 9
+_META_FRAME_COUNT = 32
+
 
 def _register_fonts():
     bundled = os.path.join(_HERE, 'NotoSansSC-Regular.otf')
@@ -164,10 +167,13 @@ def decode_gif(path, rb, progress_cb):
 
 
 def decode_video(path, rb, progress_cb, tmp_jpg):
-    """视频取帧：用 Bitmap.compress 存成 JPEG 再让 PIL 读。
+    """视频取帧解码。
 
-    不用 Bitmap.getPixels(int[], ...)：那是 Java 输出参数，pyjnius 不会回填，
-    会返回 None 导致 'NoneType' object is not iterable。
+    优先 getFrameAtIndex 逐帧（API 28+）保证不漏帧；
+    退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
+    注意 option=2 是 OPTION_CLOSEST_SYNC，只返回关键帧，会大量漏帧。
+    Bitmap 用 compress(JPEG) 存临时文件再让 PIL 读（getPixels 的 int[] 是
+    Java 输出参数，pyjnius 不回填）。
     """
     from jnius import autoclass
     MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
@@ -176,37 +182,59 @@ def decode_video(path, rb, progress_cb, tmp_jpg):
 
     mmr = MediaMetadataRetriever()
     mmr.setDataSource(path)
-    duration_ms = int(mmr.extractMetadata(9))
-    step_ms = 200
-    i = 0
+
+    def _handle(bmp):
+        if bmp is None:
+            return False
+        fos = FileOutputStream(tmp_jpg)
+        try:
+            bmp.compress(CompressFormat.JPEG, 90, fos)
+        finally:
+            try:
+                fos.close()
+            except Exception:
+                pass
+        try:
+            bmp.recycle()
+        except Exception:
+            pass
+        img = Image.open(tmp_jpg)
+        try:
+            t = decode_qr(img)
+        finally:
+            img.close()
+        if t:
+            rb.feed(t)
+        return rb.is_done()
+
     try:
-        while i < duration_ms:
-            bmp = mmr.getFrameAtTime(i * 1000, 2)
-            if bmp is not None:
-                fos = FileOutputStream(tmp_jpg)
-                try:
-                    bmp.compress(CompressFormat.JPEG, 90, fos)
-                finally:
-                    try:
-                        fos.close()
-                    except Exception:
-                        pass
-                try:
-                    bmp.recycle()
-                except Exception:
-                    pass
-                img = Image.open(tmp_jpg)
-                try:
-                    t = decode_qr(img)
-                finally:
-                    img.close()
-                if t:
-                    rb.feed(t)
-            i += step_ms
-            if progress_cb:
-                progress_cb(i, duration_ms)
-            if rb.is_done():
-                break
+        frame_count = 0
+        try:
+            v = mmr.extractMetadata(_META_FRAME_COUNT)
+            if v:
+                frame_count = int(v)
+        except Exception:
+            frame_count = 0
+
+        if frame_count > 0:
+            for idx in range(frame_count):
+                if _handle(mmr.getFrameAtIndex(idx)):
+                    break
+                if progress_cb:
+                    progress_cb(idx + 1, frame_count)
+        else:
+            duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
+            step_ms = 100
+            t = 0
+            total = max(1, duration_ms // step_ms)
+            k = 0
+            while t < duration_ms:
+                if _handle(mmr.getFrameAtTime(t * 1000, 3)):
+                    break
+                t += step_ms
+                k += 1
+                if progress_cb:
+                    progress_cb(k, total)
     finally:
         try:
             mmr.release()
@@ -517,7 +545,7 @@ class RootWidget(BoxLayout):
 
     def _share(self, path, name):
         try:
-            from jnius import autoclass
+            from jnius import autoclass, cast, JavaMethod
             Intent = autoclass('android.content.Intent')
             File = autoclass('java.io.File')
             Uri = autoclass('android.net.Uri')
@@ -531,9 +559,17 @@ class RootWidget(BoxLayout):
             except Exception:
                 pass
 
+            uri = Uri.fromFile(File(path))
             intent = Intent(Intent.ACTION_SEND)
             intent.setType('*/*')
-            intent.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(File(path)))
+            try:
+                _put_extra = JavaMethod(
+                    'putExtra',
+                    '(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;')
+                _put_extra(intent, Intent.EXTRA_STREAM,
+                           cast('android.os.Parcelable', uri))
+            except Exception:
+                intent.setDataAndType(uri, '*/*')
             chooser = Intent.createChooser(intent, '保存 / 分享文件')
             activity.startActivity(chooser)
         except Exception as e:
