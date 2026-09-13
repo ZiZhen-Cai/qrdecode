@@ -163,35 +163,60 @@ def decode_gif(path, rb, progress_cb):
     im.close()
 
 
-def decode_video(path, rb, progress_cb):
+def decode_video(path, rb, progress_cb, tmp_jpg):
+    """视频取帧：用 Bitmap.compress 存成 JPEG 再让 PIL 读。
+
+    不用 Bitmap.getPixels(int[], ...)：那是 Java 输出参数，pyjnius 不会回填，
+    会返回 None 导致 'NoneType' object is not iterable。
+    """
     from jnius import autoclass
     MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
+    CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
+    FileOutputStream = autoclass('java.io.FileOutputStream')
+
     mmr = MediaMetadataRetriever()
     mmr.setDataSource(path)
     duration_ms = int(mmr.extractMetadata(9))
     step_ms = 200
     i = 0
-    while i < duration_ms:
-        bmp = mmr.getFrameAtTime(i * 1000, 2)
-        if bmp is not None:
-            w = bmp.getWidth()
-            h = bmp.getHeight()
-            buf = bmp.getPixels([0] * (w * h), 0, w, 0, 0, w, h)
-            px = bytearray()
-            for c in buf:
-                px.append((c >> 16) & 0xFF)
-                px.append((c >> 8) & 0xFF)
-                px.append(c & 0xFF)
-            img = Image.frombytes('RGB', (w, h), bytes(px))
-            t = decode_qr(img)
-            if t:
-                rb.feed(t)
-        i += step_ms
-        if progress_cb:
-            progress_cb(i, duration_ms)
-        if rb.is_done():
-            break
-    mmr.release()
+    try:
+        while i < duration_ms:
+            bmp = mmr.getFrameAtTime(i * 1000, 2)
+            if bmp is not None:
+                fos = FileOutputStream(tmp_jpg)
+                try:
+                    bmp.compress(CompressFormat.JPEG, 90, fos)
+                finally:
+                    try:
+                        fos.close()
+                    except Exception:
+                        pass
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
+                img = Image.open(tmp_jpg)
+                try:
+                    t = decode_qr(img)
+                finally:
+                    img.close()
+                if t:
+                    rb.feed(t)
+            i += step_ms
+            if progress_cb:
+                progress_cb(i, duration_ms)
+            if rb.is_done():
+                break
+    finally:
+        try:
+            mmr.release()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(tmp_jpg):
+                os.remove(tmp_jpg)
+        except Exception:
+            pass
 
 
 class Card(BoxLayout):
@@ -268,44 +293,66 @@ class RootWidget(BoxLayout):
                          size_hint_y=None, height=dp(26),
                          font_size=dp(13.5), color=CLR_SUB)
         self.add_widget(subtitle)
-        self.add_widget(BoxLayout(size_hint_y=None, height=dp(14)))
+        self.add_widget(BoxLayout(size_hint_y=None, height=dp(12)))
 
         self.btn_pick = PrimaryButton(text='选择 GIF / 视频文件', size_hint_y=None,
                                       height=dp(62))
         self.btn_pick.bind(on_press=self.pick_file)
         self.add_widget(self.btn_pick)
 
-        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(96),
+        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(130),
                            padding=dp(14), spacing=dp(10))
         self.status = Label(text='等待选择文件…', color=CLR_TEXT,
-                            font_size=dp(14.5), halign='left', valign='middle')
+                            font_size=dp(14), halign='left', valign='top')
         self.status.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
         status_card.add_widget(self.status)
         self.progress = RoundedProgress(max=100, value=0, size_hint_y=None,
                                         height=dp(12))
         status_card.add_widget(self.progress)
+        self.btn_share = Button(text='保存 / 分享还原的文件', size_hint_y=None,
+                                height=dp(40), background_normal='',
+                                background_color=(0, 0, 0, 0), color=CLR_PRIMARY,
+                                font_size=dp(14), bold=True, disabled=True)
+        self.btn_share.bind(on_press=self._on_share)
+        status_card.add_widget(self.btn_share)
         self.add_widget(status_card)
 
-        tips_card = Card(orientation='vertical', size_hint_y=None, height=dp(150),
+        tips_card = Card(orientation='vertical', size_hint_y=None, height=dp(120),
                          padding=dp(16), spacing=dp(6))
         tips_card.add_widget(Label(text='使用说明', color=CLR_TEXT, bold=True,
                                    font_size=dp(15), size_hint_y=None, height=dp(26),
                                    halign='left', valign='middle'))
         for line in ('1. 选择含二维码的 GIF 或视频文件',
                      '2. 自动逐帧解码并按协议重组',
-                     '3. 还原完成后可分享 / 保存'):
+                     '3. 还原完成后点上方按钮保存 / 分享'):
             lb = Label(text=line, color=CLR_SUB, font_size=dp(13),
-                       size_hint_y=None, height=dp(28), halign='left', valign='middle')
+                       size_hint_y=None, height=dp(26), halign='left', valign='middle')
             lb.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
             tips_card.add_widget(lb)
         self.add_widget(tips_card)
 
         self.add_widget(BoxLayout())
         self._thread = None
+        self._last_path = None
 
     def _sync_bg(self, *a):
         self._bgrect.pos = self.pos
         self._bgrect.size = self.size
+
+    def _out_dir(self):
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            d = PythonActivity.mActivity.getExternalFilesDir(None)
+            if d is not None:
+                p = d.getAbsolutePath()
+                if p and os.path.isdir(p):
+                    return p
+        except Exception:
+            pass
+        d = self.app.user_data_dir
+        os.makedirs(d, exist_ok=True)
+        return d
 
     def pick_file(self, instance):
         self._set_status('正在打开文件选择器…', CLR_SUB)
@@ -344,6 +391,7 @@ class RootWidget(BoxLayout):
     def _handle_uri(self, uri):
         self._set_status('正在读取文件…', CLR_TEXT)
         self.btn_pick.disabled = True
+        self.btn_share.disabled = True
         self.progress.value = 0
         t = threading.Thread(target=self._copy_and_decode, args=(uri,))
         t.daemon = True
@@ -383,12 +431,10 @@ class RootWidget(BoxLayout):
             pass
 
         name = os.path.basename(name) or 'input.dat'
-        d = self.app.user_data_dir
+        d = self._out_dir()
         os.makedirs(d, exist_ok=True)
-        out = os.path.join(d, name)
+        out = os.path.join(d, '_src_' + name)
 
-        # 用 ParcelFileDescriptor 拿 Linux fd，再由 Python 原生 os.read 读取。
-        # （绕开 pyjnius 的 Java 数组创建与重载方法解析问题）
         pfd = resolver.openFileDescriptor(uri, 'r')
         try:
             fd = pfd.getFd()
@@ -414,7 +460,8 @@ class RootWidget(BoxLayout):
             if ext == '.gif':
                 decode_gif(path, rb, lambda i, n: self._update(i, n))
             else:
-                decode_video(path, rb, lambda i, n: self._update(i, n))
+                tmp_jpg = os.path.join(self._out_dir(), '_frame.jpg')
+                decode_video(path, rb, lambda i, n: self._update(i, n), tmp_jpg)
 
             if not rb.is_done():
                 got, total = rb.progress()
@@ -438,7 +485,7 @@ class RootWidget(BoxLayout):
         Clock.schedule_once(_do)
 
     def _save(self, data, name):
-        d = self.app.user_data_dir
+        d = self._out_dir()
         os.makedirs(d, exist_ok=True)
         out = os.path.join(d, name)
         with open(out, 'wb') as f:
@@ -448,11 +495,13 @@ class RootWidget(BoxLayout):
     def _done(self, path, name):
         self.btn_pick.disabled = False
         self.progress.value = 100
-        self._set_status('还原成功: %s' % name, CLR_OK)
-        self._share(path, name)
+        self._last_path = path
+        self.btn_share.disabled = False
+        self._set_status('还原成功：%s\n保存位置：\n%s' % (name, path), CLR_OK)
 
     def _fail(self, msg):
         self.btn_pick.disabled = False
+        self.btn_share.disabled = True
         self.progress.value = 0
         self._set_status('失败: %s' % msg, CLR_ERR)
 
@@ -460,12 +509,38 @@ class RootWidget(BoxLayout):
         self.status.text = text
         self.status.color = color
 
+    def _on_share(self, instance):
+        if self._last_path and os.path.exists(self._last_path):
+            self._share(self._last_path, os.path.basename(self._last_path))
+        else:
+            self._set_status('文件不存在，无法分享', CLR_ERR)
+
     def _share(self, path, name):
         try:
-            from plyer import share
-            share.share(title='分享文件', text='已还原: %s' % name, path=path)
-        except Exception:
-            pass
+            from jnius import autoclass
+            Intent = autoclass('android.content.Intent')
+            File = autoclass('java.io.File')
+            Uri = autoclass('android.net.Uri')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity = PythonActivity.mActivity
+
+            try:
+                StrictMode = autoclass('android.os.StrictMode')
+                VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
+                StrictMode.setVmPolicy(VmPolicyBuilder().build())
+            except Exception:
+                pass
+
+            intent = Intent(Intent.ACTION_SEND)
+            intent.setType('*/*')
+            intent.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(File(path)))
+            chooser = Intent.createChooser(intent, '保存 / 分享文件')
+            activity.startActivity(chooser)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            msg = '分享失败（文件已保存到上方路径）: %s' % e
+            self._set_status(msg, CLR_ERR)
 
 
 class QrDecodeApp(App):
