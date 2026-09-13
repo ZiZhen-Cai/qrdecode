@@ -18,7 +18,6 @@ import zlib
 
 # zbarlight 内部 `from pkg_resources import get_distribution` 取版本号，
 # 但安卓（Python 3.14 + setuptools 新版）没有 pkg_resources，会导致 import 失败并闪退。
-# 这里在导入 zbarlight 前 mock 一个最小实现（仅需 get_distribution().version）。
 try:
     import pkg_resources  # noqa: F401
 except ImportError:
@@ -34,17 +33,25 @@ from PIL import Image
 import zbarlight
 
 from kivy.app import App
+from kivy.clock import Clock
+from kivy.core.text import LabelBase
+from kivy.graphics import Color, RoundedRectangle
+from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.progressbar import ProgressBar
-from kivy.clock import Clock
-from kivy.core.text import LabelBase
+from kivy.utils import get_color_from_hex
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-# 修复中文乱码：Kivy 默认字体 Roboto 不含中文字形，会显示成方块。
-# 动态扫描安卓系统字体目录，找一个 CJK 字体注册为 Roboto。
-def _register_cjk_font():
+def _register_fonts():
+    """优先用打包进 APK 的中文字体，其次找系统 CJK 字体。"""
+    bundled = os.path.join(_HERE, 'NotoSansSC-Regular.otf')
+    if os.path.exists(bundled):
+        LabelBase.register(name='Roboto', fn_regular=bundled)
+        return
     d = '/system/fonts'
     try:
         names = os.listdir(d)
@@ -54,7 +61,6 @@ def _register_cjk_font():
     cands = [os.path.join(d, fn) for fn in names
              if fn.lower().endswith(('.ttf', '.otf', '.ttc'))
              and any(k in fn.lower() for k in keys)]
-    # ttf/otf 优先（ttc 字体集合 Kivy 可能不支持）
     cands.sort(key=lambda p: (p.lower().endswith('.ttc'), p))
     for p in cands:
         try:
@@ -63,7 +69,18 @@ def _register_cjk_font():
         except Exception:
             continue
 
-_register_cjk_font()
+
+_register_fonts()
+
+
+CLR_BG = get_color_from_hex('#12141C')
+CLR_CARD = get_color_from_hex('#1E2230')
+CLR_PRIMARY = get_color_from_hex('#4A7BF7')
+CLR_PRIMARY_D = get_color_from_hex('#3A63D0')
+CLR_TEXT = get_color_from_hex('#EEF1F7')
+CLR_SUB = get_color_from_hex('#8A93A8')
+CLR_OK = get_color_from_hex('#37C08A')
+CLR_ERR = get_color_from_hex('#F2555A')
 
 
 def crc32(data):
@@ -121,7 +138,6 @@ class Rebuilder(object):
 
 
 def decode_qr(pil_img):
-    """对 PIL Image 做二维码识别，返回文本或 None。"""
     try:
         img = pil_img.convert('L')
         img.load()
@@ -149,67 +165,166 @@ def decode_gif(path, rb, progress_cb):
 
 
 def decode_video(path, rb, progress_cb):
-    try:
-        from jnius import autoclass
-        MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
-        mmr = MediaMetadataRetriever()
-        mmr.setDataSource(path)
-        duration_ms = int(mmr.extractMetadata(9))
-        step_us = 200000
-        i = 0
-        while i * 1000 < duration_ms:
-            bmp = mmr.getFrameAtTime(i * 1000, 2)
-            if bmp is not None:
-                w = bmp.getWidth()
-                h = bmp.getHeight()
-                buf = bmp.getPixels([0] * (w * h), 0, w, 0, 0, w, h)
-                from PIL import Image as _Image
-                px = bytearray()
-                for c in buf:
-                    px.append((c >> 16) & 0xFF)
-                    px.append((c >> 8) & 0xFF)
-                    px.append(c & 0xFF)
-                img = _Image.frombytes('RGB', (w, h), bytes(px))
-                t = decode_qr(img)
-                if t:
-                    rb.feed(t)
-            i += step_us // 1000
-            if progress_cb:
-                progress_cb(i, duration_ms // 1000)
-            if rb.is_done():
-                break
-        mmr.release()
-    except Exception as e:
-        raise RuntimeError('视频解码失败: %s' % e)
+    from jnius import autoclass
+    MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
+    mmr = MediaMetadataRetriever()
+    mmr.setDataSource(path)
+    duration_ms = int(mmr.extractMetadata(9))
+    step_ms = 200
+    i = 0
+    while i < duration_ms:
+        bmp = mmr.getFrameAtTime(i * 1000, 2)
+        if bmp is not None:
+            w = bmp.getWidth()
+            h = bmp.getHeight()
+            buf = bmp.getPixels([0] * (w * h), 0, w, 0, 0, w, h)
+            px = bytearray()
+            for c in buf:
+                px.append((c >> 16) & 0xFF)
+                px.append((c >> 8) & 0xFF)
+                px.append(c & 0xFF)
+            img = Image.frombytes('RGB', (w, h), bytes(px))
+            t = decode_qr(img)
+            if t:
+                rb.feed(t)
+        i += step_ms
+        if progress_cb:
+            progress_cb(i, duration_ms)
+        if rb.is_done():
+            break
+    mmr.release()
+
+
+class Card(BoxLayout):
+    def __init__(self, bg=None, radius=18, **kw):
+        super().__init__(**kw)
+        self._bg = bg or CLR_CARD
+        with self.canvas.before:
+            self._color = Color(*self._bg)
+            self._rect = RoundedRectangle(radius=[dp(radius)])
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *a):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+
+class PrimaryButton(Button):
+    def __init__(self, **kw):
+        kw.setdefault('background_normal', '')
+        kw.setdefault('background_color', (0, 0, 0, 0))
+        kw.setdefault('color', (1, 1, 1, 1))
+        kw.setdefault('font_size', dp(19))
+        kw.setdefault('bold', True)
+        super().__init__(**kw)
+        with self.canvas.before:
+            self._color = Color(*CLR_PRIMARY)
+            self._rect = RoundedRectangle(radius=[dp(14)])
+        self.bind(pos=self._sync, size=self._sync, state=self._on_state)
+
+    def _sync(self, *a):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+    def _on_state(self, *a):
+        self._color.rgba = CLR_PRIMARY_D if self.state == 'down' else CLR_PRIMARY
+
+
+class RoundedProgress(ProgressBar):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        with self.canvas.before:
+            Color(*CLR_CARD)
+            self._bg_rect = RoundedRectangle(radius=[dp(6)])
+        with self.canvas.after:
+            self._bar_color = Color(*CLR_PRIMARY)
+            self._bar_rect = RoundedRectangle(radius=[dp(6)])
+        self.bind(pos=self._sync, size=self._sync, value=self._sync_value)
+
+    def _sync(self, *a):
+        self._bg_rect.pos = self.pos
+        self._bg_rect.size = self.size
+        self._sync_value()
+
+    def _sync_value(self, *a):
+        frac = (self.value / self.max) if self.max else 0
+        frac = max(0.0, min(1.0, frac))
+        self._bar_rect.pos = self.pos
+        self._bar_rect.size = (self.width * frac, self.height)
 
 
 class RootWidget(BoxLayout):
     def __init__(self, **kw):
-        super().__init__(orientation='vertical', padding=24, spacing=14, **kw)
+        super().__init__(orientation='vertical', padding=dp(20), spacing=dp(14), **kw)
         self.app = App.get_running_app()
-        self.title = Label(text='二维码文件解析器', size_hint_y=None, height=48,
-                           font_size=22, bold=True)
-        self.add_widget(self.title)
-        self.btn_pick = Button(text='选择 GIF / 视频文件', size_hint_y=None,
-                               height=56, font_size=18)
+        with self.canvas.before:
+            Color(*CLR_BG)
+            self._bgrect = RoundedRectangle(radius=[0])
+        self.bind(pos=self._sync_bg, size=self._sync_bg)
+
+        title = Label(text='二维码文件解析器', size_hint_y=None, height=dp(46),
+                      font_size=dp(25), bold=True, color=CLR_TEXT)
+        self.add_widget(title)
+        subtitle = Label(text='从 GIF / 视频中解码二维码，还原文件',
+                         size_hint_y=None, height=dp(26),
+                         font_size=dp(13.5), color=CLR_SUB)
+        self.add_widget(subtitle)
+        self.add_widget(BoxLayout(size_hint_y=None, height=dp(14)))
+
+        self.btn_pick = PrimaryButton(text='选择 GIF / 视频文件', size_hint_y=None,
+                                      height=dp(62))
         self.btn_pick.bind(on_press=self.pick_file)
         self.add_widget(self.btn_pick)
-        self.status = Label(text='等待选择文件…', size_hint_y=None, height=40,
-                            font_size=15)
-        self.add_widget(self.status)
-        self.progress = ProgressBar(max=100, value=0)
-        self.add_widget(self.progress)
+
+        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(96),
+                           padding=dp(14), spacing=dp(10))
+        self.status = Label(text='等待选择文件…', color=CLR_TEXT,
+                            font_size=dp(14.5), halign='left', valign='middle')
+        self.status.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
+        status_card.add_widget(self.status)
+        self.progress = RoundedProgress(max=100, value=0, size_hint_y=None,
+                                        height=dp(12))
+        status_card.add_widget(self.progress)
+        self.add_widget(status_card)
+
+        tips_card = Card(orientation='vertical', size_hint_y=None, height=dp(150),
+                         padding=dp(16), spacing=dp(6))
+        tips_card.add_widget(Label(text='使用说明', color=CLR_TEXT, bold=True,
+                                   font_size=dp(15), size_hint_y=None, height=dp(26),
+                                   halign='left', valign='middle'))
+        for line in ('1. 选择含二维码的 GIF 或视频文件',
+                     '2. 自动逐帧解码并按协议重组',
+                     '3. 还原完成后可分享 / 保存'):
+            lb = Label(text=line, color=CLR_SUB, font_size=dp(13),
+                       size_hint_y=None, height=dp(28), halign='left', valign='middle')
+            lb.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
+            tips_card.add_widget(lb)
+        self.add_widget(tips_card)
+
+        self.add_widget(BoxLayout())
         self._thread = None
 
+    def _sync_bg(self, *a):
+        self._bgrect.pos = self.pos
+        self._bgrect.size = self.size
+
     def pick_file(self, instance):
-        from plyer import filechooser
-        filechooser.open_file(on_selection=self.on_selected)
+        self._set_status('正在打开文件选择器…', CLR_SUB)
+        try:
+            from plyer import filechooser
+            filechooser.open_file(on_selection=self.on_selected)
+        except Exception as e:
+            self._set_status('选择器打开失败: %s' % e, CLR_ERR)
 
     def on_selected(self, selection):
+        Clock.schedule_once(lambda dt: self._handle_selection(selection))
+
+    def _handle_selection(self, selection):
         if not selection:
+            self._set_status('未选择文件', CLR_SUB)
             return
-        path = selection[0]
-        self.status.text = '解码中: %s' % os.path.basename(path)
+        path = selection[0] if isinstance(selection, (list, tuple)) else selection
+        self._set_status('已选择: %s' % path, CLR_TEXT)
         self.btn_pick.disabled = True
         self.progress.value = 0
         self._thread = threading.Thread(target=self._decode_worker, args=(path,))
@@ -218,26 +333,31 @@ class RootWidget(BoxLayout):
 
     def _decode_worker(self, path):
         rb = Rebuilder()
-        ext = os.path.splitext(path)[1].lower()
+        ext = os.path.splitext(str(path))[1].lower()
         try:
             if ext == '.gif':
                 decode_gif(path, rb, lambda i, n: self._update(i, n))
             else:
                 decode_video(path, rb, lambda i, n: self._update(i, n))
+
             if not rb.is_done():
-                Clock.schedule_once(lambda dt: self._fail('帧未收齐: %s' % rb.progress()))
+                got, total = rb.progress()
+                Clock.schedule_once(
+                    lambda dt: self._fail('帧未收齐（%s / %s）' % (got, total)))
                 return
             data, name = rb.rebuild()
             out = self._save(data, name)
             Clock.schedule_once(lambda dt: self._done(out, name))
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             Clock.schedule_once(lambda dt: self._fail(str(e)))
 
     def _update(self, i, n):
         def _do(dt):
             if isinstance(n, int) and n > 0:
                 self.progress.value = min(100, i * 100 // n)
-            self.status.text = '解码中… 帧 %s / %s' % (i, n)
+            self._set_status('解码中… 帧 %s / %s' % (i, n), CLR_TEXT)
         Clock.schedule_once(_do)
 
     def _save(self, data, name):
@@ -251,13 +371,17 @@ class RootWidget(BoxLayout):
     def _done(self, path, name):
         self.btn_pick.disabled = False
         self.progress.value = 100
-        self.status.text = '还原成功: %s' % name
+        self._set_status('还原成功: %s' % name, CLR_OK)
         self._share(path, name)
 
     def _fail(self, msg):
         self.btn_pick.disabled = False
         self.progress.value = 0
-        self.status.text = '失败: %s' % msg
+        self._set_status('失败: %s' % msg, CLR_ERR)
+
+    def _set_status(self, text, color):
+        self.status.text = text
+        self.status.color = color
 
     def _share(self, path, name):
         try:
