@@ -363,7 +363,7 @@ class RootWidget(BoxLayout):
         self._decode_worker(local)
 
     def _uri_to_file(self, uri):
-        from jnius import autoclass
+        from jnius import autoclass, jarray
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
         resolver = PythonActivity.mActivity.getContentResolver()
 
@@ -386,12 +386,23 @@ class RootWidget(BoxLayout):
         os.makedirs(d, exist_ok=True)
         out = os.path.join(d, name)
 
-        Files = autoclass('java.nio.file.Files')
-        Paths = autoclass('java.nio.file.Paths')
+        # 手动流式复制。不用 Files.copy：pyjnius 对 Java 重载方法会误匹配
+        # （曾把 Path 参数错配到 OutputStream 重载，抛 TypeError）。
+        FileOutputStream = autoclass('java.io.FileOutputStream')
         istream = resolver.openInputStream(uri)
+        fos = FileOutputStream(out)
+        buf = jarray('b')(65536)
         try:
-            Files.copy(istream, Paths.get(out))
+            while True:
+                n = istream.read(buf, 0, 65536)
+                if n <= 0:
+                    break
+                fos.write(buf, 0, n)
         finally:
+            try:
+                fos.close()
+            except Exception:
+                pass
             try:
                 istream.close()
             except Exception:
