@@ -169,8 +169,8 @@ def decode_gif(path, rb, progress_cb):
 def decode_video(path, rb, progress_cb, tmp_jpg):
     """视频取帧解码。
 
-    优先 getFrameAtIndex 逐帧（API 28+）保证不漏帧；
-    退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
+    优先 getFrameAtIndex（API 28+），按约每秒 8 帧抽帧（视频帧率远高于二维码
+    刷新率，逐帧处理有大量重复解码）；退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
     注意 option=2 是 OPTION_CLOSEST_SYNC，只返回关键帧，会大量漏帧。
     Bitmap 用 compress(JPEG) 存临时文件再让 PIL 读（getPixels 的 int[] 是
     Java 输出参数，pyjnius 不回填）。
@@ -217,14 +217,23 @@ def decode_video(path, rb, progress_cb, tmp_jpg):
             frame_count = 0
 
         if frame_count > 0:
-            for idx in range(frame_count):
+            duration_ms = 0
+            try:
+                duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
+            except Exception:
+                duration_ms = 0
+            fps = (frame_count / (duration_ms / 1000.0)) if duration_ms > 0 else 30.0
+            stride = max(1, int(round(fps / 8.0)))
+            indexes = list(range(0, frame_count, stride))
+            total = len(indexes)
+            for n, idx in enumerate(indexes):
                 if _handle(mmr.getFrameAtIndex(idx)):
                     break
                 if progress_cb:
-                    progress_cb(idx + 1, frame_count)
+                    progress_cb(n + 1, total)
         else:
             duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
-            step_ms = 100
+            step_ms = 120
             t = 0
             total = max(1, duration_ms // step_ms)
             k = 0
@@ -570,8 +579,10 @@ class RootWidget(BoxLayout):
                            cast('android.os.Parcelable', uri))
             except Exception:
                 intent.setDataAndType(uri, '*/*')
-            chooser = Intent.createChooser(intent, '保存 / 分享文件')
-            activity.startActivity(chooser)
+            # 不用 Intent.createChooser：第 2 参是 CharSequence，pyjnius 传 Python
+            # 字符串找不到匹配重载（No static methods called createChooser）。
+            # ACTION_SEND 直接 startActivity 时系统会自动弹选择器。
+            activity.startActivity(intent)
         except Exception as e:
             import traceback
             traceback.print_exc()
