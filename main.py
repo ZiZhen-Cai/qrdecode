@@ -84,6 +84,12 @@ CLR_ERR = get_color_from_hex('#F2555A')
 
 _PICK_REQ = 0x5A5C
 
+# 还原文件的保存位置：公共「下载」目录下的 App 专属子文件夹
+_RELATIVE_DIR = 'Download/QRDecode'
+_DISPLAY_DIR = '下载/QRDecode'
+_DOC_URI = ('content://com.android.externalstorage.documents/document/'
+            'primary%3ADownload%2FQRDecode')
+
 
 def crc32(data):
     crc = 0xFFFFFFFF
@@ -352,7 +358,7 @@ class RootWidget(BoxLayout):
                                    halign='left', valign='middle'))
         for line in ('1. 选择含二维码的 GIF 或视频文件',
                      '2. 自动逐帧解码并按协议重组',
-                     '3. 还原后文件存到「下载」目录，可点上方查看'):
+                     '3. 还原后文件存到「下载/QRDecode」，可点上方查看'):
             lb = Label(text=line, color=CLR_SUB, font_size=dp(13),
                        size_hint_y=None, height=dp(26), halign='left', valign='middle')
             lb.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
@@ -502,7 +508,10 @@ class RootWidget(BoxLayout):
         Clock.schedule_once(_do)
 
     def _save(self, data, name):
-        """保存到公共「下载」目录（MediaStore，Android 10+）；失败退回 App 目录。"""
+        """保存到公共「下载/QRDecode」目录（MediaStore，Android 10+）。
+
+        失败退回 App 私有目录。返回给界面显示的保存位置描述。
+        """
         try:
             from jnius import autoclass
             MediaStoreDownloads = autoclass('android.provider.MediaStore$Downloads')
@@ -512,9 +521,11 @@ class RootWidget(BoxLayout):
 
             values = ContentValues()
             values.put('_display_name', name)
+            # App 专属子目录：/storage/emulated/0/Download/QRDecode/
+            values.put('relative_path', _RELATIVE_DIR)
             uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
             if uri is None:
-                raise RuntimeError('MediaStore.insert returned None')
+                raise RuntimeError('MediaStore.insert 返回空')
             pfd = resolver.openFileDescriptor(uri, 'w')
             try:
                 fd = pfd.getFd()
@@ -527,7 +538,7 @@ class RootWidget(BoxLayout):
                     pfd.close()
                 except Exception:
                     pass
-            return '下载/' + name
+            return _DISPLAY_DIR + '/' + name
         except Exception:
             import traceback
             traceback.print_exc()
@@ -558,11 +569,13 @@ class RootWidget(BoxLayout):
         self._open_folder()
 
     def _open_folder(self):
-        """打开系统文件管理器（DocumentsUI）并定位到「下载」目录。
+        """打开系统文件管理器并直接进入 App 的「下载/QRDecode」目录。
 
-        不要用 resource/folder MIME：那是第三方文件管理器的约定，
-        系统自带 DocumentsUI 未注册，会弹出「打开方式」且无可选项。
-        用 SAF 的 ACTION_OPEN_DOCUMENT_TREE，系统文件管理器必响应。
+        用 ACTION_VIEW + SAF 的 document URI（MIME = vnd.android.document/directory）
+        直接浏览该目录。注意：
+        - resource/folder 是第三方约定，系统 DocumentsUI 不认（会弹「打开方式」）；
+        - ACTION_OPEN_DOCUMENT_TREE 是「选择目录」语义，且 Android 11+ 禁止选中
+          Download / Android/data（会提示「无法使用此文件夹」）。
         """
         from jnius import autoclass
         Intent = autoclass('android.content.Intent')
@@ -571,19 +584,19 @@ class RootWidget(BoxLayout):
         activity = PythonActivity.mActivity
 
         try:
-            intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-            try:
-                from jnius import cast, JavaMethod
-                dl = Uri.parse(
-                    'content://com.android.externalstorage.documents/document/'
-                    'primary%3ADownload')
-                _put = JavaMethod(
-                    'putExtra',
-                    '(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;')
-                _put(intent, 'android.provider.extra.INITIAL_URI',
-                     cast('android.os.Parcelable', dl))
-            except Exception:
-                pass
+            uri = Uri.parse(_DOC_URI)
+            intent = Intent(Intent.ACTION_VIEW)
+            intent.setDataAndType(uri, 'vnd.android.document/directory')
+            activity.startActivity(intent)
+            return
+        except Exception:
+            pass
+
+        try:
+            uri = Uri.parse(
+                'content://com.android.externalstorage.documents/document/primary%3ADownload')
+            intent = Intent(Intent.ACTION_VIEW)
+            intent.setDataAndType(uri, 'vnd.android.document/directory')
             activity.startActivity(intent)
             return
         except Exception:
