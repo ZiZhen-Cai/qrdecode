@@ -167,13 +167,13 @@ def decode_gif(path, rb, progress_cb):
 
 
 def decode_video(path, rb, progress_cb, tmp_jpg):
-    """视频取帧解码。
+    """视频取帧解码（逐帧，保证不漏帧）。
 
-    优先 getFrameAtIndex（API 28+），按约每秒 8 帧抽帧（视频帧率远高于二维码
-    刷新率，逐帧处理有大量重复解码）；退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
-    注意 option=2 是 OPTION_CLOSEST_SYNC，只返回关键帧，会大量漏帧。
-    Bitmap 用 compress(JPEG) 存临时文件再让 PIL 读（getPixels 的 int[] 是
-    Java 输出参数，pyjnius 不回填）。
+    - 逐帧 getFrameAtIndex（API 28+）；退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
+      注意 option=2 是 OPTION_CLOSEST_SYNC，只返回关键帧，会大量漏帧。
+    - 抽帧会漏帧，不要用。
+    - Bitmap 用 compress(JPEG) 存临时文件再让 PIL 读
+      （getPixels 的 int[] 是 Java 输出参数，pyjnius 不回填）。
     """
     from jnius import autoclass
     MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
@@ -217,23 +217,14 @@ def decode_video(path, rb, progress_cb, tmp_jpg):
             frame_count = 0
 
         if frame_count > 0:
-            duration_ms = 0
-            try:
-                duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
-            except Exception:
-                duration_ms = 0
-            fps = (frame_count / (duration_ms / 1000.0)) if duration_ms > 0 else 30.0
-            stride = max(1, int(round(fps / 8.0)))
-            indexes = list(range(0, frame_count, stride))
-            total = len(indexes)
-            for n, idx in enumerate(indexes):
+            for idx in range(frame_count):
                 if _handle(mmr.getFrameAtIndex(idx)):
                     break
                 if progress_cb:
-                    progress_cb(n + 1, total)
+                    progress_cb(idx + 1, frame_count)
         else:
             duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
-            step_ms = 120
+            step_ms = 100
             t = 0
             total = max(1, duration_ms // step_ms)
             k = 0
@@ -337,7 +328,7 @@ class RootWidget(BoxLayout):
         self.btn_pick.bind(on_press=self.pick_file)
         self.add_widget(self.btn_pick)
 
-        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(130),
+        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(140),
                            padding=dp(14), spacing=dp(10))
         self.status = Label(text='等待选择文件…', color=CLR_TEXT,
                             font_size=dp(14), halign='left', valign='top')
@@ -346,12 +337,12 @@ class RootWidget(BoxLayout):
         self.progress = RoundedProgress(max=100, value=0, size_hint_y=None,
                                         height=dp(12))
         status_card.add_widget(self.progress)
-        self.btn_share = Button(text='保存 / 分享还原的文件', size_hint_y=None,
-                                height=dp(40), background_normal='',
-                                background_color=(0, 0, 0, 0), color=CLR_PRIMARY,
-                                font_size=dp(14), bold=True, disabled=True)
-        self.btn_share.bind(on_press=self._on_share)
-        status_card.add_widget(self.btn_share)
+        self.btn_open = Button(text='在文件管理器中查看', size_hint_y=None,
+                               height=dp(40), background_normal='',
+                               background_color=(0, 0, 0, 0), color=CLR_PRIMARY,
+                               font_size=dp(14), bold=True, disabled=True)
+        self.btn_open.bind(on_press=self._on_open_folder)
+        status_card.add_widget(self.btn_open)
         self.add_widget(status_card)
 
         tips_card = Card(orientation='vertical', size_hint_y=None, height=dp(120),
@@ -361,7 +352,7 @@ class RootWidget(BoxLayout):
                                    halign='left', valign='middle'))
         for line in ('1. 选择含二维码的 GIF 或视频文件',
                      '2. 自动逐帧解码并按协议重组',
-                     '3. 还原完成后点上方按钮保存 / 分享'):
+                     '3. 还原后文件存到「下载」目录，可点上方查看'):
             lb = Label(text=line, color=CLR_SUB, font_size=dp(13),
                        size_hint_y=None, height=dp(26), halign='left', valign='middle')
             lb.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
@@ -376,17 +367,7 @@ class RootWidget(BoxLayout):
         self._bgrect.pos = self.pos
         self._bgrect.size = self.size
 
-    def _out_dir(self):
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            d = PythonActivity.mActivity.getExternalFilesDir(None)
-            if d is not None:
-                p = d.getAbsolutePath()
-                if p and os.path.isdir(p):
-                    return p
-        except Exception:
-            pass
+    def _tmp_dir(self):
         d = self.app.user_data_dir
         os.makedirs(d, exist_ok=True)
         return d
@@ -428,7 +409,7 @@ class RootWidget(BoxLayout):
     def _handle_uri(self, uri):
         self._set_status('正在读取文件…', CLR_TEXT)
         self.btn_pick.disabled = True
-        self.btn_share.disabled = True
+        self.btn_open.disabled = True
         self.progress.value = 0
         t = threading.Thread(target=self._copy_and_decode, args=(uri,))
         t.daemon = True
@@ -468,8 +449,7 @@ class RootWidget(BoxLayout):
             pass
 
         name = os.path.basename(name) or 'input.dat'
-        d = self._out_dir()
-        os.makedirs(d, exist_ok=True)
+        d = self._tmp_dir()
         out = os.path.join(d, '_src_' + name)
 
         pfd = resolver.openFileDescriptor(uri, 'r')
@@ -497,7 +477,7 @@ class RootWidget(BoxLayout):
             if ext == '.gif':
                 decode_gif(path, rb, lambda i, n: self._update(i, n))
             else:
-                tmp_jpg = os.path.join(self._out_dir(), '_frame.jpg')
+                tmp_jpg = os.path.join(self._tmp_dir(), '_frame.jpg')
                 decode_video(path, rb, lambda i, n: self._update(i, n), tmp_jpg)
 
             if not rb.is_done():
@@ -506,8 +486,8 @@ class RootWidget(BoxLayout):
                     lambda dt: self._fail('帧未收齐（%s / %s）' % (got, total)))
                 return
             data, name = rb.rebuild()
-            out = self._save(data, name)
-            Clock.schedule_once(lambda dt: self._done(out, name))
+            where = self._save(data, name)
+            Clock.schedule_once(lambda dt: self._done(where, name))
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -522,23 +502,51 @@ class RootWidget(BoxLayout):
         Clock.schedule_once(_do)
 
     def _save(self, data, name):
-        d = self._out_dir()
-        os.makedirs(d, exist_ok=True)
-        out = os.path.join(d, name)
-        with open(out, 'wb') as f:
-            f.write(data)
-        return out
+        """保存到公共「下载」目录（MediaStore，Android 10+）；失败退回 App 目录。"""
+        try:
+            from jnius import autoclass
+            MediaStoreDownloads = autoclass('android.provider.MediaStore$Downloads')
+            ContentValues = autoclass('android.content.ContentValues')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            resolver = PythonActivity.mActivity.getContentResolver()
 
-    def _done(self, path, name):
+            values = ContentValues()
+            values.put('_display_name', name)
+            uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+            if uri is None:
+                raise RuntimeError('MediaStore.insert returned None')
+            pfd = resolver.openFileDescriptor(uri, 'w')
+            try:
+                fd = pfd.getFd()
+                mv = memoryview(data)
+                off = 0
+                while off < len(mv):
+                    off += os.write(fd, mv[off:])
+            finally:
+                try:
+                    pfd.close()
+                except Exception:
+                    pass
+            return '下载/' + name
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            d = self._tmp_dir()
+            out = os.path.join(d, name)
+            with open(out, 'wb') as f:
+                f.write(data)
+            return out
+
+    def _done(self, where, name):
         self.btn_pick.disabled = False
         self.progress.value = 100
-        self._last_path = path
-        self.btn_share.disabled = False
-        self._set_status('还原成功：%s\n保存位置：\n%s' % (name, path), CLR_OK)
+        self._last_path = where
+        self.btn_open.disabled = False
+        self._set_status('还原成功：%s\n保存位置：%s' % (name, where), CLR_OK)
 
     def _fail(self, msg):
         self.btn_pick.disabled = False
-        self.btn_share.disabled = True
+        self.btn_open.disabled = True
         self.progress.value = 0
         self._set_status('失败: %s' % msg, CLR_ERR)
 
@@ -546,48 +554,36 @@ class RootWidget(BoxLayout):
         self.status.text = text
         self.status.color = color
 
-    def _on_share(self, instance):
-        if self._last_path and os.path.exists(self._last_path):
-            self._share(self._last_path, os.path.basename(self._last_path))
-        else:
-            self._set_status('文件不存在，无法分享', CLR_ERR)
+    def _on_open_folder(self, instance):
+        self._open_folder()
 
-    def _share(self, path, name):
+    def _open_folder(self):
+        """调系统文件管理器打开「下载」目录。"""
+        from jnius import autoclass
+        Intent = autoclass('android.content.Intent')
+        Uri = autoclass('android.net.Uri')
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        activity = PythonActivity.mActivity
+
         try:
-            from jnius import autoclass, cast, JavaMethod
-            Intent = autoclass('android.content.Intent')
-            File = autoclass('java.io.File')
-            Uri = autoclass('android.net.Uri')
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity = PythonActivity.mActivity
-
-            try:
-                StrictMode = autoclass('android.os.StrictMode')
-                VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
-                StrictMode.setVmPolicy(VmPolicyBuilder().build())
-            except Exception:
-                pass
-
-            uri = Uri.fromFile(File(path))
-            intent = Intent(Intent.ACTION_SEND)
-            intent.setType('*/*')
-            try:
-                _put_extra = JavaMethod(
-                    'putExtra',
-                    '(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;')
-                _put_extra(intent, Intent.EXTRA_STREAM,
-                           cast('android.os.Parcelable', uri))
-            except Exception:
-                intent.setDataAndType(uri, '*/*')
-            # 不用 Intent.createChooser：第 2 参是 CharSequence，pyjnius 传 Python
-            # 字符串找不到匹配重载（No static methods called createChooser）。
-            # ACTION_SEND 直接 startActivity 时系统会自动弹选择器。
+            uri = Uri.parse(
+                'content://com.android.externalstorage.documents/root/primary')
+            intent = Intent(Intent.ACTION_VIEW)
+            intent.setDataAndType(uri, 'resource/folder')
             activity.startActivity(intent)
+            return
+        except Exception:
+            pass
+
+        try:
+            intent = Intent(Intent.ACTION_GET_CONTENT)
+            intent.setType('*/*')
+            activity.startActivity(intent)
+            return
         except Exception as e:
             import traceback
             traceback.print_exc()
-            msg = '分享失败（文件已保存到上方路径）: %s' % e
-            self._set_status(msg, CLR_ERR)
+            self._set_status('无法打开文件管理器: %s' % e, CLR_ERR)
 
 
 class QrDecodeApp(App):
