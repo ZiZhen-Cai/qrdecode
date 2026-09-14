@@ -558,7 +558,12 @@ class RootWidget(BoxLayout):
         self._open_folder()
 
     def _open_folder(self):
-        """调系统文件管理器打开「下载」目录。"""
+        """打开系统文件管理器（DocumentsUI）并定位到「下载」目录。
+
+        不要用 resource/folder MIME：那是第三方文件管理器的约定，
+        系统自带 DocumentsUI 未注册，会弹出「打开方式」且无可选项。
+        用 SAF 的 ACTION_OPEN_DOCUMENT_TREE，系统文件管理器必响应。
+        """
         from jnius import autoclass
         Intent = autoclass('android.content.Intent')
         Uri = autoclass('android.net.Uri')
@@ -566,10 +571,19 @@ class RootWidget(BoxLayout):
         activity = PythonActivity.mActivity
 
         try:
-            uri = Uri.parse(
-                'content://com.android.externalstorage.documents/root/primary')
-            intent = Intent(Intent.ACTION_VIEW)
-            intent.setDataAndType(uri, 'resource/folder')
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            try:
+                from jnius import cast, JavaMethod
+                dl = Uri.parse(
+                    'content://com.android.externalstorage.documents/document/'
+                    'primary%3ADownload')
+                _put = JavaMethod(
+                    'putExtra',
+                    '(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;')
+                _put(intent, 'android.provider.extra.INITIAL_URI',
+                     cast('android.os.Parcelable', dl))
+            except Exception:
+                pass
             activity.startActivity(intent)
             return
         except Exception:
