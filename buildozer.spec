@@ -7,7 +7,7 @@ source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas,gif,otf,ttf
 source.include_patterns = assets/*,images/*.png
 
-version = 1.0
+version = 1.1
 
 # 依赖：kivy 界面 + pillow 读 GIF + zbarlight(zbar) 解码二维码 + plyer 选文件/分享
 requirements = python3,kivy,pillow,zbarlight,plyer
@@ -16,7 +16,8 @@ orientation = portrait
 fullscreen = 0
 
 # 文件访问权限（Android 12- 用 READ_EXTERNAL_STORAGE，13+ 用 READ_MEDIA_*）
-android.permissions = INTERNET,READ_EXTERNAL_STORAGE,READ_MEDIA_VIDEO,READ_MEDIA_IMAGES
+# WAKE_LOCK：设置里的「锁屏后继续解码」（PARTIAL_WAKE_LOCK）
+android.permissions = INTERNET,READ_EXTERNAL_STORAGE,READ_MEDIA_VIDEO,READ_MEDIA_IMAGES,WAKE_LOCK
 android.api = 33
 android.minapi = 21
 android.archs = arm64-v8a

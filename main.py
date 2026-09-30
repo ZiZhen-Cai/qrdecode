@@ -8,14 +8,26 @@
 帧协议（与 PC 端 encode.py 一致）：
   头帧   QRH|<总字节数>|<总帧数>|<crc32>|<md5>|<原始文件名>
   数据帧 QRD|<序号>|<总帧数>|<base64>
+
+v1.1 提速与设置：
+  - 识别前降采样（长边 >_MAX_SIDE 的帧先缩小，像素量减 40~60%）
+  - 视频帧改内存 JPEG（pyjnius byte[] → Python bytes），去掉临时文件落盘
+  - fork 多进程并行识别（_MAX_WORKERS 个 worker 真正吃满多核；
+    创建失败/超时/进程退出均自动回退单线程全量重解）
+  - 设置卡片：解码时屏幕常亮 / 锁屏后继续解码(PARTIAL_WAKE_LOCK) /
+    多核并行开关，本地 settings.json 持久化
 """
 import base64
+import io
+import json
 import os
 import sys
 import threading
 import types
 import zlib
 
+# zbarlight 内部 `from pkg_resources import get_distribution` 取版本号，
+# 但安卓（Python 3.14 + setuptools 新版）没有 pkg_resources，会导致 import 失败并闪退。
 try:
     import pkg_resources  # noqa: F401
 except ImportError:
@@ -39,6 +51,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.progressbar import ProgressBar
+from kivy.uix.switch import Switch
 from kivy.utils import get_color_from_hex
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,8 +59,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _META_DURATION = 9
 _META_FRAME_COUNT = 32
 
+# 解码提速：长边超过该值的帧先降采样再识别（二维码每格仍有约 5px，
+# 识别率基本无损；拍摄时让二维码占画面大一些更稳）
+_MAX_SIDE = 1280
+# 并行解码 worker 数上限（fork 子进程，真正吃满多核；失败自动回退单线程）
+_MAX_WORKERS = 3
+
+
+# ==================== 字体 ====================
 
 def _register_fonts():
+    """优先用打包进 APK 的中文字体，其次找系统 CJK 字体。"""
     bundled = os.path.join(_HERE, 'NotoSansSC-Regular.otf')
     if os.path.exists(bundled):
         LabelBase.register(name='Roboto', fn_regular=bundled)
@@ -73,6 +95,8 @@ def _register_fonts():
 _register_fonts()
 
 
+# ==================== 配色 ====================
+
 CLR_BG = get_color_from_hex('#12141C')
 CLR_CARD = get_color_from_hex('#1E2230')
 CLR_PRIMARY = get_color_from_hex('#4A7BF7')
@@ -85,19 +109,92 @@ CLR_ERR = get_color_from_hex('#F2555A')
 _PICK_REQ = 0x5A5C
 
 # 还原文件的保存位置：公共「下载」目录下的 App 专属子文件夹
-_RELATIVE_DIR = 'Download/QRDecode'
-_DISPLAY_DIR = '下载/QRDecode'
+_RELATIVE_DIR = 'Download/QRDecode'                    # MediaStore 用
+_DISPLAY_DIR = '下载/QRDecode'                          # 界面显示
 _DOC_URI = ('content://com.android.externalstorage.documents/document/'
-            'primary%3ADownload%2FQRDecode')
+            'primary%3ADownload%2FQRDecode')           # 浏览该目录用
 
+
+# ==================== 设置持久化 / 电源管理 ====================
+
+_SETTINGS_FILE = 'settings.json'
+_DEFAULT_SETTINGS = {'keep_on': True, 'wakelock': False, 'parallel': True}
+
+
+def _load_settings(app):
+    s = dict(_DEFAULT_SETTINGS)
+    try:
+        with open(os.path.join(app.user_data_dir, _SETTINGS_FILE),
+                  'r', encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            for k in s:
+                if k in d:
+                    s[k] = bool(d[k])
+    except Exception:
+        pass
+    return s
+
+
+def _save_settings(app, d):
+    try:
+        with open(os.path.join(app.user_data_dir, _SETTINGS_FILE),
+                  'w', encoding='utf-8') as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _keep_screen_on(enable):
+    """FLAG_KEEP_SCREEN_ON：解码期间防止锁屏。"""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        window = PythonActivity.mActivity.getWindow()
+        if enable:
+            window.addFlags(0x00000080)   # WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        else:
+            window.clearFlags(0x00000080)
+    except Exception:
+        pass
+
+
+class _WakeLock(object):
+    """PARTIAL_WAKE_LOCK：锁屏后保持 CPU 运行，解码线程继续跑。
+
+    说明：这是「够用级」的后台继续方案；彻底后台保活需要前台 Service。
+    """
+
+    def __init__(self):
+        self._wl = None
+
+    def acquire(self):
+        try:
+            if self._wl is None:
+                from jnius import autoclass
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                Context = autoclass('android.content.Context')
+                PowerManager = autoclass('android.os.PowerManager')
+                pm = PythonActivity.mActivity.getSystemService(Context.POWER_SERVICE)
+                wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, 'qrdecode:decode')
+                wl.setReferenceCounted(False)
+                self._wl = wl
+            self._wl.acquire()
+        except Exception:
+            self._wl = None
+
+    def release(self):
+        try:
+            if self._wl is not None and self._wl.isHeld():
+                self._wl.release()
+        except Exception:
+            pass
+
+
+# ==================== 帧协议 ====================
 
 def crc32(data):
-    crc = 0xFFFFFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 else 0)
-    return crc ^ 0xFFFFFFFF
+    return zlib.crc32(data) & 0xFFFFFFFF
 
 
 class Rebuilder(object):
@@ -120,8 +217,11 @@ class Rebuilder(object):
             q = text.split('|')
             seq = int(q[1])
             if seq not in self.seen:
-                self.seen.add(seq)
-                self.chunks[seq] = q[3]
+                try:
+                    self.chunks[seq] = base64.b64decode(q[3])
+                    self.seen.add(seq)
+                except Exception:
+                    pass  # 坏帧丢弃，GIF 循环 / 重扫会补上
 
     def progress(self):
         if not self.header:
@@ -137,7 +237,7 @@ class Rebuilder(object):
         miss = [i for i in range(1, self.header['total'] + 1) if i not in self.seen]
         if miss:
             raise RuntimeError('缺失帧: %s' % miss[:20])
-        data = b''.join(base64.b64decode(self.chunks[i])
+        data = b''.join(self.chunks[i]
                         for i in range(1, self.header['total'] + 1))
         c = format(crc32(data), '08x')
         if c != self.header['crc']:
@@ -145,9 +245,22 @@ class Rebuilder(object):
         return data, self.header.get('name', 'restored.bin')
 
 
+# ==================== 二维码识别 ====================
+
 def decode_qr(pil_img):
+    """对 PIL Image 做二维码识别，返回文本或 None。
+
+    长边超过 _MAX_SIDE 的帧先降采样再识别：像素量减 40~60%，
+    二维码每格仍有约 5px，识别率基本无损。
+    """
     try:
-        img = pil_img.convert('L')
+        img = pil_img if pil_img.mode in ('L', 'RGB') else pil_img.convert('RGB')
+        m = max(img.size)
+        if m > _MAX_SIDE:
+            r = _MAX_SIDE / float(m)
+            img = img.resize((max(1, int(img.width * r)),
+                              max(1, int(img.height * r))), Image.BILINEAR)
+        img = img.convert('L')
         img.load()
         codes = zbarlight.scan_codes('qrcode', img)
     except Exception:
@@ -157,62 +270,75 @@ def decode_qr(pil_img):
     return None
 
 
-def decode_gif(path, rb, progress_cb):
+# ==================== 帧源（迭代器） ====================
+#
+# 帧负载统一为两种：
+#   ('rgb', (w, h, rgb_bytes))  —— GIF 逐帧
+#   ('jpg', jpeg_bytes)         —— 视频帧（Java 侧已降采样 + 内存压缩）
+# 识别在主进程（单线程模式）或 fork 子进程（并行模式）中执行。
+
+def _payload_to_image(payload):
+    kind, obj = payload
+    if kind == 'rgb':
+        w, h, data = obj
+        return Image.frombytes('RGB', (w, h), data)
+    return Image.open(io.BytesIO(obj))
+
+
+def iter_gif_frames(path):
+    """逐帧产出 GIF 帧；提前停止时由调用方 close() 生成器以关闭文件。"""
     im = Image.open(path)
-    n = getattr(im, 'n_frames', 1)
-    for i in range(n):
-        im.seek(i)
-        t = decode_qr(im.convert('RGB'))
-        if t:
-            rb.feed(t)
-        if progress_cb:
-            progress_cb(i + 1, n)
-        if rb.is_done():
-            break
-    im.close()
+    try:
+        n = getattr(im, 'n_frames', 1)
+        for i in range(n):
+            im.seek(i)
+            rgb = im.convert('RGB')
+            yield i + 1, n, ('rgb', (rgb.width, rgb.height, rgb.tobytes()))
+    finally:
+        try:
+            im.close()
+        except Exception:
+            pass
 
 
-def decode_video(path, rb, progress_cb, tmp_jpg):
-    """视频取帧解码（逐帧，保证不漏帧）。
+def _scale_bitmap(Bitmap, bmp):
+    """Java 侧降采样（在 JPEG 压缩之前做，省一半以上的编码/解码开销）。"""
+    try:
+        w = bmp.getWidth()
+        h = bmp.getHeight()
+        m = max(w, h)
+        if m > _MAX_SIDE:
+            r = _MAX_SIDE / float(m)
+            small = Bitmap.createScaledBitmap(
+                bmp, max(1, int(w * r)), max(1, int(h * r)), True)
+            if small is not None:
+                return small
+    except Exception:
+        pass
+    return bmp
+
+
+def iter_video_frames(path):
+    """逐帧产出视频帧。
 
     - 逐帧 getFrameAtIndex（API 28+）；退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
       注意 option=2 是 OPTION_CLOSEST_SYNC，只返回关键帧，会大量漏帧。
+    - Bitmap → ByteArrayOutputStream 内存 JPEG（pyjnius 会把 byte[] 返回值转成
+      Python bytes），不再落临时文件；若该机型 byte[] 转换不可用，
+      自动退回「临时文件」老路径。
     - 抽帧会漏帧，不要用。
-    - Bitmap 用 compress(JPEG) 存临时文件再让 PIL 读
-      （getPixels 的 int[] 是 Java 输出参数，pyjnius 不回填）。
     """
     from jnius import autoclass
     MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
     CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
+    Bitmap = autoclass('android.graphics.Bitmap')
+    ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
     FileOutputStream = autoclass('java.io.FileOutputStream')
 
     mmr = MediaMetadataRetriever()
     mmr.setDataSource(path)
-
-    def _handle(bmp):
-        if bmp is None:
-            return False
-        fos = FileOutputStream(tmp_jpg)
-        try:
-            bmp.compress(CompressFormat.JPEG, 90, fos)
-        finally:
-            try:
-                fos.close()
-            except Exception:
-                pass
-        try:
-            bmp.recycle()
-        except Exception:
-            pass
-        img = Image.open(tmp_jpg)
-        try:
-            t = decode_qr(img)
-        finally:
-            img.close()
-        if t:
-            rb.feed(t)
-        return rb.is_done()
-
+    tmp_jpg = None
+    mem_ok = True
     try:
         frame_count = 0
         try:
@@ -222,36 +348,255 @@ def decode_video(path, rb, progress_cb, tmp_jpg):
         except Exception:
             frame_count = 0
 
-        if frame_count > 0:
-            for idx in range(frame_count):
-                if _handle(mmr.getFrameAtIndex(idx)):
-                    break
-                if progress_cb:
-                    progress_cb(idx + 1, frame_count)
-        else:
+        use_index = frame_count > 0
+        duration_ms = 0
+        if not use_index:
             duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
-            step_ms = 100
-            t = 0
-            total = max(1, duration_ms // step_ms)
-            k = 0
-            while t < duration_ms:
-                if _handle(mmr.getFrameAtTime(t * 1000, 3)):
+        step_ms = 100
+        total = frame_count if use_index else max(1, duration_ms // step_ms)
+        i = 0
+        while True:
+            if use_index:
+                if i >= frame_count:
                     break
-                t += step_ms
-                k += 1
-                if progress_cb:
-                    progress_cb(k, total)
+                bmp = mmr.getFrameAtIndex(i)
+            else:
+                t = i * step_ms
+                if t >= duration_ms:
+                    break
+                bmp = mmr.getFrameAtTime(t * 1000, 3)
+            i += 1
+            if bmp is None:
+                yield i, total, None
+                continue
+            bmp = _scale_bitmap(Bitmap, bmp)
+            payload = None
+            if mem_ok:
+                try:
+                    baos = ByteArrayOutputStream()
+                    bmp.compress(CompressFormat.JPEG, 85, baos)
+                    data = baos.toByteArray()
+                    if not isinstance(data, (bytes, bytearray)) or not data:
+                        raise TypeError('byte[] 无法转为 Python bytes')
+                    payload = ('jpg', bytes(data))
+                    try:
+                        baos.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    mem_ok = False   # 该机型 pyjnius 数组转换受限，整段退回临时文件
+            if payload is None:
+                if tmp_jpg is None:
+                    tmp_jpg = path + '_frame.jpg'
+                fos = FileOutputStream(tmp_jpg)
+                try:
+                    bmp.compress(CompressFormat.JPEG, 85, fos)
+                finally:
+                    try:
+                        fos.close()
+                    except Exception:
+                        pass
+                with open(tmp_jpg, 'rb') as f:
+                    payload = ('jpg', f.read())
+            try:
+                bmp.recycle()
+            except Exception:
+                pass
+            yield i, total, payload
     finally:
         try:
             mmr.release()
         except Exception:
             pass
+        if tmp_jpg:
+            try:
+                if os.path.exists(tmp_jpg):
+                    os.remove(tmp_jpg)
+            except Exception:
+                pass
+
+
+# ==================== 解码驱动（单线程 / 并行） ====================
+
+def decode_frames_sequential(frame_iter, rb, progress_cb):
+    """单线程逐帧解码。"""
+    for idx, total, payload in frame_iter:
+        if rb.is_done():
+            break
+        if payload is not None:
+            try:
+                img = _payload_to_image(payload)
+                try:
+                    text = decode_qr(img)
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+            except Exception:
+                text = None
+            if text:
+                rb.feed(text)
+        if progress_cb:
+            progress_cb(idx, total)
+
+
+def _parallel_worker(recv_conn, send_conn):
+    """并行解码子进程主体（fork 启动；只碰 PIL/zbar，绝不碰 JNI）。"""
+    try:
+        while True:
+            payload = recv_conn.recv()
+            if payload is None:
+                break
+            text = None
+            try:
+                img = _payload_to_image(payload)
+                try:
+                    text = decode_qr(img)
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+            except Exception:
+                text = None
+            send_conn.send(text)
+    except Exception:
+        pass   # 管道关闭 / 进程被终止：安静退出
+
+
+class _ParallelDecoder(object):
+    """fork 多进程并行解码器（仅 Android/POSIX 可用）。
+
+    超时 / 进程死亡都以异常暴露，由调用方回退单线程全量重解。
+    """
+
+    FIRST_TIMEOUT = 30.0    # 首帧结果超时（秒）
+    RESULT_TIMEOUT = 60.0   # 后续每帧结果超时（秒）
+
+    def __init__(self, workers=_MAX_WORKERS):
+        import multiprocessing
+        self._ctx = multiprocessing.get_context('fork')
+        self._n = max(2, min(workers, self._ctx.cpu_count() or 2))
+        self._procs = []
+        self._sends = []   # 父进程发任务
+        self._recvs = []   # 父进程收结果
+        self._rr = 0
+
+    @property
+    def n(self):
+        return self._n
+
+    def start(self):
         try:
-            if os.path.exists(tmp_jpg):
-                os.remove(tmp_jpg)
+            for _ in range(self._n):
+                p2c_r, p2c_s = self._ctx.Pipe(duplex=False)
+                c2p_r, c2p_s = self._ctx.Pipe(duplex=False)
+                p = self._ctx.Process(target=_parallel_worker,
+                                      args=(p2c_r, c2p_s), daemon=True)
+                p.start()
+                try:
+                    p2c_r.close()   # 关掉父进程不用的端，保证 EOF 能被感知
+                    c2p_s.close()
+                except Exception:
+                    pass
+                self._procs.append(p)
+                self._sends.append(p2c_s)
+                self._recvs.append(c2p_r)
+        except Exception:
+            self.shutdown()
+            raise
+
+    def send(self, payload):
+        self._sends[self._rr % self._n].send(payload)
+        self._rr += 1
+
+    def recv_any(self, first):
+        from multiprocessing.connection import wait
+        timeout = self.FIRST_TIMEOUT if first else self.RESULT_TIMEOUT
+        ready = wait(self._recvs, timeout=timeout)
+        if not ready:
+            raise RuntimeError('并行解码等待结果超时')
+        out = []
+        for c in ready:
+            try:
+                out.append(c.recv())
+            except (EOFError, OSError) as e:
+                raise RuntimeError('并行解码 worker 异常退出: %s' % e)
+        return out
+
+    def shutdown(self):
+        for s in self._sends:
+            try:
+                s.send(None)
+            except Exception:
+                pass
+        for p in self._procs:
+            try:
+                p.join(timeout=0.5)
+            except Exception:
+                pass
+        for p in self._procs:
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except Exception:
+                pass
+        for c in self._recvs + self._sends:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+def decode_frames_parallel(frame_iter, rb, progress_cb):
+    """并行解码：主进程取帧，多个 fork 子进程并行识别。
+
+    帧之间互相独立（协议按序号重组），乱序返回不影响正确性。
+    任一异常向上抛出，调用方回退单线程全量重解。
+    """
+    pool = _ParallelDecoder()
+    pool.start()
+    in_flight = 0   # 已发未收的帧数
+    results = 0
+    total = 0
+    first = True
+    done = False
+    try:
+        it = frame_iter
+        while not done:
+            # 填流水线：在途帧数保持在 worker 数的 2 倍，防止 worker 空转
+            while in_flight < 2 * pool.n:
+                try:
+                    idx, total, payload = next(it)
+                except StopIteration:
+                    break
+                if payload is not None:
+                    pool.send(payload)
+                    in_flight += 1
+            if in_flight == 0:
+                break
+            texts = pool.recv_any(first)
+            first = False
+            for text in texts:
+                in_flight -= 1
+                results += 1
+                if text:
+                    rb.feed(text)
+                if progress_cb and total:
+                    progress_cb(results, total)
+                if rb.is_done():
+                    done = True
+                    break
+    finally:
+        try:
+            frame_iter.close()
         except Exception:
             pass
+        pool.shutdown()
 
+
+# ==================== 自定义控件 ====================
 
 class Card(BoxLayout):
     def __init__(self, bg=None, radius=18, **kw):
@@ -311,30 +656,33 @@ class RoundedProgress(ProgressBar):
         self._bar_rect.size = (self.width * frac, self.height)
 
 
+# ==================== 主界面 ====================
+
 class RootWidget(BoxLayout):
     def __init__(self, **kw):
-        super().__init__(orientation='vertical', padding=dp(20), spacing=dp(14), **kw)
+        super().__init__(orientation='vertical', padding=dp(20), spacing=dp(12), **kw)
         self.app = App.get_running_app()
+        self._settings = _load_settings(self.app)
         with self.canvas.before:
             Color(*CLR_BG)
             self._bgrect = RoundedRectangle(radius=[0])
         self.bind(pos=self._sync_bg, size=self._sync_bg)
 
-        title = Label(text='二维码文件解析器', size_hint_y=None, height=dp(46),
+        title = Label(text='二维码文件解析器', size_hint_y=None, height=dp(42),
                       font_size=dp(25), bold=True, color=CLR_TEXT)
         self.add_widget(title)
         subtitle = Label(text='从 GIF / 视频中解码二维码，还原文件',
                          size_hint_y=None, height=dp(26),
                          font_size=dp(13.5), color=CLR_SUB)
         self.add_widget(subtitle)
-        self.add_widget(BoxLayout(size_hint_y=None, height=dp(12)))
+        self.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
 
         self.btn_pick = PrimaryButton(text='选择 GIF / 视频文件', size_hint_y=None,
                                       height=dp(62))
         self.btn_pick.bind(on_press=self.pick_file)
         self.add_widget(self.btn_pick)
 
-        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(140),
+        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(124),
                            padding=dp(14), spacing=dp(10))
         self.status = Label(text='等待选择文件…', color=CLR_TEXT,
                             font_size=dp(14), halign='left', valign='top')
@@ -351,32 +699,57 @@ class RootWidget(BoxLayout):
         status_card.add_widget(self.btn_open)
         self.add_widget(status_card)
 
-        tips_card = Card(orientation='vertical', size_hint_y=None, height=dp(120),
+        tips_card = Card(orientation='vertical', size_hint_y=None, height=dp(104),
                          padding=dp(16), spacing=dp(6))
         tips_card.add_widget(Label(text='使用说明', color=CLR_TEXT, bold=True,
-                                   font_size=dp(15), size_hint_y=None, height=dp(26),
+                                   font_size=dp(15), size_hint_y=None, height=dp(24),
                                    halign='left', valign='middle'))
         for line in ('1. 选择含二维码的 GIF 或视频文件',
                      '2. 自动逐帧解码并按协议重组',
-                     '3. 还原后文件存到「下载/QRDecode」，可点上方查看'):
+                     '3. 还原后文件存到「下载」目录，可点上方查看'):
             lb = Label(text=line, color=CLR_SUB, font_size=dp(13),
-                       size_hint_y=None, height=dp(26), halign='left', valign='middle')
+                       size_hint_y=None, height=dp(22), halign='left', valign='middle')
             lb.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
             tips_card.add_widget(lb)
         self.add_widget(tips_card)
 
+        settings_card = Card(orientation='vertical', size_hint_y=None,
+                             height=dp(150), padding=dp(14), spacing=dp(2))
+        settings_card.add_widget(Label(
+            text='设置', color=CLR_TEXT, bold=True, font_size=dp(15),
+            size_hint_y=None, height=dp(24), halign='left', valign='middle'))
+        for caption, key in (('解码时保持屏幕常亮', 'keep_on'),
+                             ('锁屏后继续解码（唤醒锁）', 'wakelock'),
+                             ('多核并行解码（失败自动回退）', 'parallel')):
+            row = BoxLayout(size_hint_y=None, height=dp(30), spacing=dp(8))
+            lb = Label(text=caption, color=CLR_SUB, font_size=dp(13.5),
+                       halign='left', valign='middle')
+            lb.bind(size=lambda s, *a: setattr(s, 'text_size', (s.width, None)))
+            row.add_widget(lb)
+            sw = Switch(active=bool(self._settings.get(key)))
+            sw.size_hint_x = None
+            sw.width = dp(64)
+            sw.bind(active=self._on_setting(key))
+            row.add_widget(sw)
+            settings_card.add_widget(row)
+        self.add_widget(settings_card)
+
         self.add_widget(BoxLayout())
         self._thread = None
         self._last_path = None
+        self._wakelock = _WakeLock()
 
     def _sync_bg(self, *a):
         self._bgrect.pos = self.pos
         self._bgrect.size = self.size
 
     def _tmp_dir(self):
+        """临时目录（放读取到的源文件与中间帧），用 App 私有目录即可。"""
         d = self.app.user_data_dir
         os.makedirs(d, exist_ok=True)
         return d
+
+    # ---------- 文件选择 ----------
 
     def pick_file(self, instance):
         self._set_status('正在打开文件选择器…', CLR_SUB)
@@ -474,17 +847,55 @@ class RootWidget(BoxLayout):
                 pass
         return out
 
+    # ---------- 解码 ----------
+
+    def _on_setting(self, key):
+        def _bind(sw, value):
+            self._settings[key] = bool(value)
+            _save_settings(self.app, self._settings)
+        return _bind
+
+    def _apply_power(self, decoding):
+        """解码期间按设置加/释放：屏幕常亮 + 唤醒锁。"""
+        s = self._settings
+        try:
+            if s.get('keep_on', True):
+                _keep_screen_on(decoding)
+        except Exception:
+            pass
+        try:
+            if s.get('wakelock', False):
+                if decoding:
+                    self._wakelock.acquire()
+                else:
+                    self._wakelock.release()
+        except Exception:
+            pass
+
     def _decode_worker(self, path):
         Clock.schedule_once(lambda dt: self._set_status(
             '已读取，开始解码: %s' % os.path.basename(path), CLR_TEXT))
         rb = Rebuilder()
         ext = os.path.splitext(str(path))[1].lower()
+        if ext == '.gif':
+            make_iter = lambda: iter_gif_frames(path)
+        else:
+            make_iter = lambda: iter_video_frames(path)
+        progress = lambda i, n: self._update(i, n)
+        self._apply_power(True)
         try:
-            if ext == '.gif':
-                decode_gif(path, rb, lambda i, n: self._update(i, n))
-            else:
-                tmp_jpg = os.path.join(self._tmp_dir(), '_frame.jpg')
-                decode_video(path, rb, lambda i, n: self._update(i, n), tmp_jpg)
+            used_parallel = False
+            if self._settings.get('parallel', True):
+                try:
+                    decode_frames_parallel(make_iter(), rb, progress)
+                    used_parallel = True
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    Clock.schedule_once(lambda dt: self._set_status(
+                        '并行解码不可用，回退单线程…', CLR_SUB))
+            if not used_parallel:
+                decode_frames_sequential(make_iter(), rb, progress)
 
             if not rb.is_done():
                 got, total = rb.progress()
@@ -499,6 +910,8 @@ class RootWidget(BoxLayout):
             traceback.print_exc()
             msg = str(e)
             Clock.schedule_once(lambda dt: self._fail(msg))
+        finally:
+            self._apply_power(False)
 
     def _update(self, i, n):
         def _do(dt):
@@ -526,6 +939,7 @@ class RootWidget(BoxLayout):
             uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
             if uri is None:
                 raise RuntimeError('MediaStore.insert 返回空')
+            # 用 fd + Python os.write 写入（避开 pyjnius 的 Java 流/数组问题）
             pfd = resolver.openFileDescriptor(uri, 'w')
             try:
                 fd = pfd.getFd()
@@ -565,6 +979,8 @@ class RootWidget(BoxLayout):
         self.status.text = text
         self.status.color = color
 
+    # ---------- 打开文件管理器 ----------
+
     def _on_open_folder(self, instance):
         self._open_folder()
 
@@ -573,8 +989,8 @@ class RootWidget(BoxLayout):
 
         用 ACTION_VIEW + SAF 的 document URI（MIME = vnd.android.document/directory）
         直接浏览该目录。注意：
-        - resource/folder 是第三方约定，系统 DocumentsUI 不认（会弹「打开方式」）；
-        - ACTION_OPEN_DOCUMENT_TREE 是「选择目录」语义，且 Android 11+ 禁止选中
+        - `resource/folder` 是第三方约定，系统 DocumentsUI 不认（会弹「打开方式」）；
+        - `ACTION_OPEN_DOCUMENT_TREE` 是「选择目录」语义，且 Android 11+ 禁止选中
           Download / Android/data（会提示「无法使用此文件夹」）。
         """
         from jnius import autoclass
@@ -583,6 +999,7 @@ class RootWidget(BoxLayout):
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
         activity = PythonActivity.mActivity
 
+        # 1) 直接浏览「下载/QRDecode」目录
         try:
             uri = Uri.parse(_DOC_URI)
             intent = Intent(Intent.ACTION_VIEW)
@@ -592,6 +1009,7 @@ class RootWidget(BoxLayout):
         except Exception:
             pass
 
+        # 2) 退化为浏览「下载」目录
         try:
             uri = Uri.parse(
                 'content://com.android.externalstorage.documents/document/primary%3ADownload')
@@ -602,6 +1020,7 @@ class RootWidget(BoxLayout):
         except Exception:
             pass
 
+        # 3) 兜底：文件管理器的内容选择界面
         try:
             intent = Intent(Intent.ACTION_GET_CONTENT)
             intent.setType('*/*')
