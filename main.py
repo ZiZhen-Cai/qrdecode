@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import zlib
 
@@ -146,7 +147,7 @@ def _save_settings(app, d):
 
 
 def _keep_screen_on(enable):
-    """FLAG_KEEP_SCREEN_ON：解码期间防止锁屏。"""
+    """FLAG_KEEP_SCREEN_ON：解码期间防止自动息屏。成功返回 True。"""
     try:
         from jnius import autoclass
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -155,20 +156,37 @@ def _keep_screen_on(enable):
             window.addFlags(0x00000080)   # WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         else:
             window.clearFlags(0x00000080)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _has_wake_lock_permission():
+    """检查 APK 是否带 WAKE_LOCK 权限（非 Android 环境视为通过）。"""
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        return PythonActivity.mActivity.checkSelfPermission(
+            'android.permission.WAKE_LOCK') == 0
+    except Exception:
+        return True
 
 
 class _WakeLock(object):
     """PARTIAL_WAKE_LOCK：锁屏后保持 CPU 运行，解码线程继续跑。
 
     说明：这是「够用级」的后台继续方案；彻底后台保活需要前台 Service。
+    acquire() 失败不再静默——返回 (ok, err)，由界面显示原因。
     """
 
     def __init__(self):
         self._wl = None
+        self.last_error = ''
 
     def acquire(self):
+        if not _has_wake_lock_permission():
+            self.last_error = 'APK 缺少 WAKE_LOCK 权限'
+            return False, self.last_error
         try:
             if self._wl is None:
                 from jnius import autoclass
@@ -180,8 +198,18 @@ class _WakeLock(object):
                 wl.setReferenceCounted(False)
                 self._wl = wl
             self._wl.acquire()
-        except Exception:
+            self.last_error = ''
+            return True, ''
+        except Exception as e:
             self._wl = None
+            self.last_error = str(e)
+            return False, self.last_error
+
+    def held(self):
+        try:
+            return self._wl is not None and self._wl.isHeld()
+        except Exception:
+            return False
 
     def release(self):
         try:
@@ -189,6 +217,97 @@ class _WakeLock(object):
                 self._wl.release()
         except Exception:
             pass
+
+
+# ==================== 进程资源采样（CPU 使用率展示） ====================
+#
+# 口径：本进程（含全部线程）+ 并行 fork 子进程的 CPU 时间增量，
+# 除以墙钟增量 = 等效占用核数（1.0 表示吃满 1 个核，>1 表示用了多核）。
+# - 本进程：Android 官方 Process.getElapsedCpuTime()（无需权限）；
+#   桌面回退 os.times()。
+# - fork 子进程：尝试读 /proc/<pid>/stat（同 uid 可能被 SELinux 拒绝，
+#   失败静默跳过——此时只统计主进程）。
+
+_CLK_TCK = 100
+try:
+    _CLK_TCK = os.sysconf('SC_CLK_TCK')
+except Exception:
+    pass
+
+_ACTIVE_POOL_PIDS = []   # 并行解码 fork 子进程 pid 列表（供 CPU 采样读取）
+
+
+def _cpu_cores():
+    try:
+        from jnius import autoclass
+        return int(autoclass('java.lang.Runtime').getRuntime().availableProcessors())
+    except Exception:
+        return os.cpu_count() or 1
+
+
+def _proc_cpu_seconds():
+    """本进程累计 CPU 秒数（含全部线程）。"""
+    try:
+        from jnius import autoclass
+        return autoclass('android.os.Process').getElapsedCpuTime() / 1000.0
+    except Exception:
+        pass
+    try:
+        t = os.times()
+        return float(t[0]) + float(t[1])
+    except Exception:
+        return 0.0
+
+
+def _pid_cpu_seconds(pid):
+    """读 /proc/<pid>/stat 的 utime+stime（秒）。失败返回 None。"""
+    try:
+        with open('/proc/%d/stat' % pid, 'rb') as f:
+            raw = f.read().decode('ascii', 'ignore')
+        after = raw.rsplit(')', 1)[1].split()
+        return (int(after[11]) + int(after[12])) / float(_CLK_TCK)
+    except Exception:
+        return None
+
+
+def _total_cpu_seconds():
+    total = _proc_cpu_seconds()
+    for pid in list(_ACTIVE_POOL_PIDS):
+        v = _pid_cpu_seconds(pid)
+        if v:
+            total += v
+    return total
+
+
+class CpuMeter(object):
+    """CPU 占用采样器：cur/peak 单位是「等效核数」。"""
+
+    def __init__(self):
+        self.cores = _cpu_cores()
+        self.cur = 0.0
+        self.peak = 0.0
+        self._t = None
+        self._cpu = None
+        self._sum_cpu = 0.0
+        self._sum_t = 0.0
+
+    def sample(self):
+        t = time.monotonic()
+        cpu = _total_cpu_seconds()
+        if self._t is not None:
+            dt = t - self._t
+            dc = cpu - self._cpu
+            if dt > 0.05 and dc >= 0:
+                self.cur = dc / dt
+                if self.cur > self.peak:
+                    self.peak = self.cur
+                self._sum_cpu += dc
+                self._sum_t += dt
+        self._t = t
+        self._cpu = cpu
+
+    def avg(self):
+        return (self._sum_cpu / self._sum_t) if self._sum_t > 0 else 0.0
 
 
 # ==================== 帧协议 ====================
@@ -555,8 +674,10 @@ def decode_frames_parallel(frame_iter, rb, progress_cb):
     帧之间互相独立（协议按序号重组），乱序返回不影响正确性。
     任一异常向上抛出，调用方回退单线程全量重解。
     """
+    global _ACTIVE_POOL_PIDS
     pool = _ParallelDecoder()
     pool.start()
+    _ACTIVE_POOL_PIDS = [p.pid for p in pool._procs]   # 供 CPU 采样统计子进程
     in_flight = 0   # 已发未收的帧数
     results = 0
     total = 0
@@ -594,6 +715,7 @@ def decode_frames_parallel(frame_iter, rb, progress_cb):
         except Exception:
             pass
         pool.shutdown()
+        _ACTIVE_POOL_PIDS = []
 
 
 # ==================== 自定义控件 ====================
@@ -682,7 +804,7 @@ class RootWidget(BoxLayout):
         self.btn_pick.bind(on_press=self.pick_file)
         self.add_widget(self.btn_pick)
 
-        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(124),
+        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(150),
                            padding=dp(14), spacing=dp(10))
         self.status = Label(text='等待选择文件…', color=CLR_TEXT,
                             font_size=dp(14), halign='left', valign='top')
@@ -738,6 +860,16 @@ class RootWidget(BoxLayout):
         self._thread = None
         self._last_path = None
         self._wakelock = _WakeLock()
+        # 解码运行统计（_update 在 worker 线程写，_refresh_stats 在主线程读）
+        self._busy = False
+        self._prog = (0, 0)          # (已处理帧, 总帧)
+        self._t_start = 0.0
+        self._last_beat = 0.0        # 最近一次帧进展时间
+        self._max_gap = 0.0          # 相邻帧最大间隔（锁屏被冻结的证据）
+        self._wl_check_t = 0.0       # 唤醒锁自检节流
+        self._power_note = ''        # 常亮/唤醒锁状态（界面显示）
+        self._cpu = CpuMeter()
+        Clock.schedule_interval(self._refresh_stats, 0.5)
 
     def _sync_bg(self, *a):
         self._bgrect.pos = self.pos
@@ -856,21 +988,21 @@ class RootWidget(BoxLayout):
         return _bind
 
     def _apply_power(self, decoding):
-        """解码期间按设置加/释放：屏幕常亮 + 唤醒锁。"""
+        """解码期间按设置加/释放：屏幕常亮 + 唤醒锁。
+
+        返回状态描述字符串（显示在界面上，拿锁失败不再静默）。
+        """
         s = self._settings
-        try:
-            if s.get('keep_on', True):
-                _keep_screen_on(decoding)
-        except Exception:
-            pass
-        try:
-            if s.get('wakelock', False):
-                if decoding:
-                    self._wakelock.acquire()
-                else:
-                    self._wakelock.release()
-        except Exception:
-            pass
+        notes = []
+        if s.get('keep_on', True):
+            notes.append('屏幕常亮' if _keep_screen_on(decoding) else '常亮设置失败')
+        if s.get('wakelock', False):
+            if decoding:
+                ok, err = self._wakelock.acquire()
+                notes.append('唤醒锁已持有' if ok else '唤醒锁失败(%s)' % (err or '未知'))
+            else:
+                self._wakelock.release()
+        return ' ｜ '.join(notes)
 
     def _decode_worker(self, path):
         Clock.schedule_once(lambda dt: self._set_status(
@@ -882,7 +1014,17 @@ class RootWidget(BoxLayout):
         else:
             make_iter = lambda: iter_video_frames(path)
         progress = lambda i, n: self._update(i, n)
-        self._apply_power(True)
+        # 运行统计初始化（供 _refresh_stats 展示）
+        now = time.monotonic()
+        self._busy = True
+        self._prog = (0, 0)
+        self._t_start = now
+        self._last_beat = now
+        self._max_gap = 0.0
+        self._wl_check_t = 0.0
+        self._cpu = CpuMeter()
+        self._cpu.sample()
+        self._power_note = self._apply_power(True)
         try:
             used_parallel = False
             if self._settings.get('parallel', True):
@@ -911,14 +1053,39 @@ class RootWidget(BoxLayout):
             msg = str(e)
             Clock.schedule_once(lambda dt: self._fail(msg))
         finally:
+            self._busy = False
             self._apply_power(False)
 
     def _update(self, i, n):
-        def _do(dt):
-            if isinstance(n, int) and n > 0:
-                self.progress.value = min(100, i * 100 // n)
-            self._set_status('解码中… 帧 %s / %s' % (i, n), CLR_TEXT)
-        Clock.schedule_once(_do)
+        """worker 线程每条帧进展回调：只写共享数据，界面由 _refresh_stats 定时刷新。"""
+        self._prog = (i, n)
+        now = time.monotonic()
+        if self._last_beat > 0:
+            gap = now - self._last_beat
+            if gap > self._max_gap:
+                self._max_gap = gap
+        self._last_beat = now
+        # 唤醒锁自愈：开关开着却没持有（首次获取失败 / 被系统回收）就重试
+        if self._settings.get('wakelock', False) and now - self._wl_check_t > 5:
+            self._wl_check_t = now
+            if not self._wakelock.held():
+                ok, err = self._wakelock.acquire()
+                self._power_note = ('唤醒锁已持有' if ok
+                                    else '唤醒锁失败(%s)' % (err or '未知'))
+
+    def _refresh_stats(self, dt):
+        """主线程定时器（0.5s）：解码中刷新进度条与 CPU / 停顿 / 电源状态。"""
+        if not self._busy:
+            return
+        self._cpu.sample()
+        i, n = self._prog
+        if isinstance(n, int) and n > 0:
+            self.progress.value = min(100, i * 100 // n)
+        line2 = 'CPU 约 %.1f 核 / 共 %d 核 ｜ 最长帧间隔 %.1fs' % (
+            self._cpu.cur, self._cpu.cores, self._max_gap)
+        if self._power_note:
+            line2 += ' ｜ ' + self._power_note
+        self._set_status('解码中… 帧 %s / %s\n%s' % (i, n, line2), CLR_TEXT)
 
     def _save(self, data, name):
         """保存到公共「下载/QRDecode」目录（MediaStore，Android 10+）。
@@ -967,7 +1134,12 @@ class RootWidget(BoxLayout):
         self.progress.value = 100
         self._last_path = where
         self.btn_open.disabled = False
-        self._set_status('还原成功：%s\n保存位置：%s' % (name, where), CLR_OK)
+        dur = (time.monotonic() - self._t_start) if self._t_start else 0.0
+        extra = '用时 %.1fs ｜ 平均 CPU 约 %.1f 核' % (dur, self._cpu.avg())
+        if self._max_gap > 1.0:
+            extra += ' ｜ 最长帧间隔 %.1fs' % self._max_gap
+        self._set_status('还原成功：%s\n保存位置：%s\n%s' % (name, where, extra),
+                         CLR_OK)
 
     def _fail(self, msg):
         self.btn_pick.disabled = False
