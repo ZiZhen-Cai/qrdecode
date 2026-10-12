@@ -7,7 +7,7 @@ source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas,gif,otf,ttf
 source.include_patterns = assets/*,images/*.png
 
-version = 1.2
+version = 1.3
 
 # 依赖：kivy 界面 + pillow 读 GIF + zbarlight(zbar) 解码二维码 + plyer 选文件/分享
 requirements = python3,kivy,pillow,zbarlight,plyer

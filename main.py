@@ -64,7 +64,13 @@ _META_FRAME_COUNT = 32
 # 识别率基本无损；拍摄时让二维码占画面大一些更稳）
 _MAX_SIDE = 1280
 # 并行解码 worker 数上限（fork 子进程，真正吃满多核；失败自动回退单线程）
-_MAX_WORKERS = 3
+_MAX_WORKERS = 4
+# 视频取帧线程数（各自独立 MediaMetadataRetriever 实例，pyjnius 调 Java
+# 期间释放 GIL，可真正并行；该 API 非线程安全，标准做法是每线程独立实例）
+_FEED_THREADS = 2
+# 视频批量取帧数：getFramesAtIndex 一次取 N 连续帧（官方推荐，比逐帧
+# getFrameAtIndex 高效，避免每帧 seek 开销）；N 越大内存占用越高
+_FRAME_BATCH = 6
 
 
 # ==================== 字体 ====================
@@ -147,7 +153,13 @@ def _save_settings(app, d):
 
 
 def _keep_screen_on(enable):
-    """FLAG_KEEP_SCREEN_ON：解码期间防止自动息屏。成功返回 True。"""
+    """FLAG_KEEP_SCREEN_ON：解码期间防止自动息屏。
+
+    返回 (ok, err)。worker 线程直调 Window.addFlags 在部分 ROM 上会失败，
+    故本函数应由主线程调用（见 _do_keep_screen）；
+    优先 Window flags，失败退 decorView.setKeepScreenOn 双保险。
+    """
+    err1 = ''
     try:
         from jnius import autoclass
         PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -156,9 +168,17 @@ def _keep_screen_on(enable):
             window.addFlags(0x00000080)   # WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         else:
             window.clearFlags(0x00000080)
-        return True
-    except Exception:
-        return False
+        return True, ''
+    except Exception as e:
+        err1 = str(e)
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        view = PythonActivity.mActivity.getWindow().getDecorView()
+        view.setKeepScreenOn(bool(enable))
+        return True, ''
+    except Exception as e2:
+        return False, '%s / %s' % (err1[:70], str(e2)[:70])
 
 
 def _has_wake_lock_permission():
@@ -379,7 +399,8 @@ def decode_qr(pil_img):
             r = _MAX_SIDE / float(m)
             img = img.resize((max(1, int(img.width * r)),
                               max(1, int(img.height * r))), Image.BILINEAR)
-        img = img.convert('L')
+        if img.mode != 'L':
+            img = img.convert('L')   # draft 已输出 L 时跳过转换
         img.load()
         codes = zbarlight.scan_codes('qrcode', img)
     except Exception:
@@ -401,7 +422,20 @@ def _payload_to_image(payload):
     if kind == 'rgb':
         w, h, data = obj
         return Image.frombytes('RGB', (w, h), data)
-    return Image.open(io.BytesIO(obj))
+    img = Image.open(io.BytesIO(obj))
+    # JPEG 走 draft 降采样解码：解码器直接输出灰度（L），并按 1/2^k 档把长边
+    # 缩到 <= _MAX_SIDE（PIL 的 DCT 缩放档为 1/1、1/2、1/4、1/8，请求尺寸
+    # 必须 <= 源尺寸/2^k 才命中对应档），比「全解码 → resize → convert(L)」
+    # 快 2~4 倍；其它格式会忽略 draft。
+    try:
+        w, h = img.size
+        k = 0
+        while k < 3 and (max(w, h) >> k) > _MAX_SIDE:
+            k += 1
+        img.draft('L', (max(1, w >> k), max(1, h >> k)))
+    except Exception:
+        pass
+    return img
 
 
 def iter_gif_frames(path):
@@ -437,127 +471,291 @@ def _scale_bitmap(Bitmap, bmp):
     return bmp
 
 
-def iter_video_frames(path):
-    """逐帧产出视频帧。
+_JPEG_CLS = {}
 
-    - 逐帧 getFrameAtIndex（API 28+）；退化用 getFrameAtTime(t, 3=OPTION_CLOSEST)。
-      注意 option=2 是 OPTION_CLOSEST_SYNC，只返回关键帧，会大量漏帧。
-    - Bitmap → ByteArrayOutputStream 内存 JPEG（pyjnius 会把 byte[] 返回值转成
-      Python bytes），不再落临时文件；若该机型 byte[] 转换不可用，
-      自动退回「临时文件」老路径。
-    - 抽帧会漏帧，不要用。
+
+def _jpeg_cls():
+    """懒加载并缓存 Java 压缩相关类（fork 子进程不会调用到这里）。"""
+    if not _JPEG_CLS:
+        from jnius import autoclass
+        _JPEG_CLS['Bitmap'] = autoclass('android.graphics.Bitmap')
+        _JPEG_CLS['CompressFormat'] = autoclass('android.graphics.Bitmap$CompressFormat')
+        _JPEG_CLS['BS'] = autoclass('java.io.ByteArrayOutputStream')
+        _JPEG_CLS['FOS'] = autoclass('java.io.FileOutputStream')
+    return _JPEG_CLS
+
+
+def _bitmap_to_payload(bmp, path, state):
+    """Bitmap → ('jpg', bytes)（Java 侧降采样 + 内存 JPEG）。
+
+    state: {'mem_ok': bool, 'tmp': str|None}，跨帧复用。
+    byte[] 转换不可用的机型自动退回临时文件路径。
+    """
+    if bmp is None:
+        return None
+    cls = _jpeg_cls()
+    try:
+        bmp = _scale_bitmap(cls['Bitmap'], bmp)
+    except Exception:
+        pass
+    payload = None
+    if state.get('mem_ok', True):
+        try:
+            baos = cls['BS']()
+            bmp.compress(cls['CompressFormat'].JPEG, 85, baos)
+            data = baos.toByteArray()
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                raise TypeError('byte[] 无法转为 Python bytes')
+            payload = ('jpg', bytes(data))
+            try:
+                baos.close()
+            except Exception:
+                pass
+        except Exception:
+            state['mem_ok'] = False   # 该机型数组转换受限，整段退回临时文件
+    if payload is None:
+        if not state.get('tmp'):
+            state['tmp'] = '%s_frame_%d.jpg' % (path, threading.get_ident())
+        fos = cls['FOS'](state['tmp'])
+        try:
+            bmp.compress(cls['CompressFormat'].JPEG, 85, fos)
+        finally:
+            try:
+                fos.close()
+            except Exception:
+                pass
+        with open(state['tmp'], 'rb') as f:
+            payload = ('jpg', f.read())
+    try:
+        bmp.recycle()
+    except Exception:
+        pass
+    return payload
+
+
+def iter_video_frames(path):
+    """逐帧产出视频帧（'jpg' 负载）。
+
+    - 帧数可用时：多线程 + 批量取帧（见 _iter_video_frames_batched），
+      每个取帧线程持有独立 MediaMetadataRetriever 实例
+      （该 API 非线程安全，标准做法是每线程独立实例；pyjnius 调用 Java
+      期间释放 GIL，可真正并行）。
+    - 帧数不可用时：单线程按时间步进取帧（getFrameAtTime OPTION_CLOSEST）。
+    - Bitmap → Java 侧降采样 → 内存 JPEG（pyjnius 把 byte[] 转 Python bytes），
+      不落临时文件；转换不可用的机型自动退回临时文件。
     """
     from jnius import autoclass
-    MediaMetadataRetriever = autoclass('android.media.MediaMetadataRetriever')
-    CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
-    Bitmap = autoclass('android.graphics.Bitmap')
-    ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
-    FileOutputStream = autoclass('java.io.FileOutputStream')
-
-    mmr = MediaMetadataRetriever()
-    mmr.setDataSource(path)
-    tmp_jpg = None
-    mem_ok = True
+    MMR = autoclass('android.media.MediaMetadataRetriever')
+    probe = MMR()
+    probe.setDataSource(path)
+    frame_count = 0
+    duration_ms = 0
     try:
-        frame_count = 0
         try:
-            v = mmr.extractMetadata(_META_FRAME_COUNT)
+            v = probe.extractMetadata(_META_FRAME_COUNT)
             if v:
                 frame_count = int(v)
         except Exception:
             frame_count = 0
-
-        use_index = frame_count > 0
-        duration_ms = 0
-        if not use_index:
-            duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
-        step_ms = 100
-        total = frame_count if use_index else max(1, duration_ms // step_ms)
-        i = 0
-        while True:
-            if use_index:
-                if i >= frame_count:
-                    break
-                bmp = mmr.getFrameAtIndex(i)
-            else:
-                t = i * step_ms
-                if t >= duration_ms:
-                    break
-                bmp = mmr.getFrameAtTime(t * 1000, 3)
-            i += 1
-            if bmp is None:
-                yield i, total, None
-                continue
-            bmp = _scale_bitmap(Bitmap, bmp)
-            payload = None
-            if mem_ok:
-                try:
-                    baos = ByteArrayOutputStream()
-                    bmp.compress(CompressFormat.JPEG, 85, baos)
-                    data = baos.toByteArray()
-                    if not isinstance(data, (bytes, bytearray)) or not data:
-                        raise TypeError('byte[] 无法转为 Python bytes')
-                    payload = ('jpg', bytes(data))
-                    try:
-                        baos.close()
-                    except Exception:
-                        pass
-                except Exception:
-                    mem_ok = False   # 该机型 pyjnius 数组转换受限，整段退回临时文件
-            if payload is None:
-                if tmp_jpg is None:
-                    tmp_jpg = path + '_frame.jpg'
-                fos = FileOutputStream(tmp_jpg)
-                try:
-                    bmp.compress(CompressFormat.JPEG, 85, fos)
-                finally:
-                    try:
-                        fos.close()
-                    except Exception:
-                        pass
-                with open(tmp_jpg, 'rb') as f:
-                    payload = ('jpg', f.read())
+        if not frame_count:
             try:
-                bmp.recycle()
+                duration_ms = int(probe.extractMetadata(_META_DURATION) or 0)
             except Exception:
-                pass
-            yield i, total, payload
+                duration_ms = 0
+    finally:
+        try:
+            probe.release()
+        except Exception:
+            pass
+
+    if frame_count > 0:
+        yield from _iter_video_frames_batched(path, frame_count)
+    else:
+        yield from _iter_video_frames_by_time(path, duration_ms)
+
+
+def _iter_video_frames_by_time(path, duration_ms):
+    """帧数不可用时的退化路径：单线程按时间步进（OPTION_CLOSEST=3）。"""
+    from jnius import autoclass
+    MMR = autoclass('android.media.MediaMetadataRetriever')
+    mmr = MMR()
+    mmr.setDataSource(path)
+    state = {'mem_ok': True, 'tmp': None}
+    step_ms = 100
+    total = max(1, duration_ms // step_ms)
+    i = 0
+    try:
+        while i < total:
+            try:
+                bmp = mmr.getFrameAtTime(i * step_ms * 1000, 3)
+            except Exception:
+                bmp = None
+            yield i + 1, total, _bitmap_to_payload(bmp, path, state)
+            i += 1
     finally:
         try:
             mmr.release()
         except Exception:
             pass
-        if tmp_jpg:
+        if state.get('tmp'):
             try:
-                if os.path.exists(tmp_jpg):
-                    os.remove(tmp_jpg)
+                if os.path.exists(state['tmp']):
+                    os.remove(state['tmp'])
+            except Exception:
+                pass
+
+
+def _q_put(q, item, stop):
+    """带 stop 感知的队列投递：队列满（背压）时也能及时响应停止。"""
+    while not stop.is_set():
+        try:
+            q.put(item, timeout=0.5)
+            return
+        except Exception:
+            pass
+
+
+def _iter_video_frames_batched(path, total, threads=_FEED_THREADS, batch=_FRAME_BATCH):
+    """多线程批量取帧：每线程独立 MMR 实例 + getFramesAtIndex 连续批量解码。
+
+    - getFramesAtIndex 为官方推荐（连续多帧批量取比逐帧 getFrameAtIndex 高效，
+      避免每帧 seek / 解码器初始化开销）；批量调用失败自动退回逐帧。
+    - 产出经有界队列（maxsize=24）汇总——天然背压，防内存堆积。
+    - 任一取帧线程异常 → '__error__' 哨兵上抛，调用方回退单线程全量重解。
+    """
+    import queue as _queue
+    from jnius import autoclass
+    MMR = autoclass('android.media.MediaMetadataRetriever')
+
+    q = _queue.Queue(maxsize=24)
+    stop = threading.Event()
+    n_threads = max(1, min(int(threads), 4))
+
+    def _feed(seg_start, seg_end):
+        state = {'mem_ok': True, 'tmp': None}
+        mmr = None
+        try:
+            mmr = MMR()
+            mmr.setDataSource(path)
+            i = seg_start
+            while i < seg_end and not stop.is_set():
+                n = min(batch, seg_end - i)
+                frames = None
+                try:
+                    frames = mmr.getFramesAtIndex(i, n)
+                except Exception:
+                    frames = None
+                if frames is not None:
+                    cnt = n
+                    try:
+                        cnt = int(frames.size())
+                    except Exception:
+                        pass
+                    k = 0
+                    while k < cnt and not stop.is_set():
+                        bmp = None
+                        try:
+                            bmp = frames.get(k)
+                        except Exception:
+                            pass
+                        _q_put(q, (i + k + 1, total,
+                                   _bitmap_to_payload(bmp, path, state)), stop)
+                        k += 1
+                else:
+                    for k in range(n):
+                        if stop.is_set():
+                            break
+                        bmp = None
+                        try:
+                            bmp = mmr.getFrameAtIndex(i + k)
+                        except Exception:
+                            pass
+                        _q_put(q, (i + k + 1, total,
+                                   _bitmap_to_payload(bmp, path, state)), stop)
+                i += n
+        except Exception as e:
+            try:
+                q.put(('__error__', str(e)), timeout=5)
+            except Exception:
+                pass
+        finally:
+            try:
+                if mmr is not None:
+                    mmr.release()
+            except Exception:
+                pass
+            if state.get('tmp'):
+                try:
+                    if os.path.exists(state['tmp']):
+                        os.remove(state['tmp'])
+                except Exception:
+                    pass
+            try:
+                q.put(('__thread_done__', None), timeout=5)
+            except Exception:
+                pass
+
+    started = 0
+    feed_ts = []
+    for t in range(n_threads):
+        a = t * total // n_threads
+        b = (t + 1) * total // n_threads
+        if a >= b:
+            continue
+        th = threading.Thread(target=_feed, args=(a, b), daemon=True)
+        th.start()
+        feed_ts.append(th)
+        started += 1
+
+    pending = started
+    try:
+        while pending > 0:
+            item = q.get()
+            if item[0] == '__thread_done__':
+                pending -= 1
+                continue
+            if item[0] == '__error__':
+                raise RuntimeError('视频取帧失败: %s' % item[1])
+            yield item
+    finally:
+        stop.set()
+        for th in feed_ts:
+            try:
+                th.join(timeout=0.2)
             except Exception:
                 pass
 
 
 # ==================== 解码驱动（单线程 / 并行） ====================
 
-def decode_frames_sequential(frame_iter, rb, progress_cb):
-    """单线程逐帧解码。"""
-    for idx, total, payload in frame_iter:
-        if rb.is_done():
-            break
-        if payload is not None:
-            try:
-                img = _payload_to_image(payload)
+def decode_frames_sequential(make_iter, rb, progress_cb):
+    """单线程逐帧解码。make_iter 为帧源工厂（调用时才创建帧源）。"""
+    frame_iter = make_iter()
+    try:
+        for idx, total, payload in frame_iter:
+            if rb.is_done():
+                break
+            if payload is not None:
                 try:
-                    text = decode_qr(img)
-                finally:
+                    img = _payload_to_image(payload)
                     try:
-                        img.close()
-                    except Exception:
-                        pass
-            except Exception:
-                text = None
-            if text:
-                rb.feed(text)
-        if progress_cb:
-            progress_cb(idx, total)
+                        text = decode_qr(img)
+                    finally:
+                        try:
+                            img.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    text = None
+                if text:
+                    rb.feed(text)
+            if progress_cb:
+                progress_cb(idx, total)
+    finally:
+        try:
+            frame_iter.close()
+        except Exception:
+            pass
 
 
 def _parallel_worker(recv_conn, send_conn):
@@ -601,6 +799,7 @@ class _ParallelDecoder(object):
         self._sends = []   # 父进程发任务
         self._recvs = []   # 父进程收结果
         self._rr = 0
+        self._send_lock = threading.Lock()   # 多取帧线程并发 send 保护
 
     @property
     def n(self):
@@ -627,8 +826,10 @@ class _ParallelDecoder(object):
             raise
 
     def send(self, payload):
-        self._sends[self._rr % self._n].send(payload)
-        self._rr += 1
+        # Connection 不支持并发写：多取帧线程下必须串行化
+        with self._send_lock:
+            self._sends[self._rr % self._n].send(payload)
+            self._rr += 1
 
     def recv_any(self, first):
         from multiprocessing.connection import wait
@@ -668,26 +869,30 @@ class _ParallelDecoder(object):
                 pass
 
 
-def decode_frames_parallel(frame_iter, rb, progress_cb):
+def decode_frames_parallel(make_iter, rb, progress_cb):
     """并行解码：主进程取帧，多个 fork 子进程并行识别。
 
     帧之间互相独立（协议按序号重组），乱序返回不影响正确性。
     任一异常向上抛出，调用方回退单线程全量重解。
+    make_iter 为帧源工厂——fork worker 须先创建、再创建帧源
+    （视频取帧会启动线程，fork 要先于线程创建）。
     """
     global _ACTIVE_POOL_PIDS
     pool = _ParallelDecoder()
     pool.start()
     _ACTIVE_POOL_PIDS = [p.pid for p in pool._procs]   # 供 CPU 采样统计子进程
+    frame_iter = None
     in_flight = 0   # 已发未收的帧数
     results = 0
     total = 0
     first = True
     done = False
     try:
+        frame_iter = make_iter()
         it = frame_iter
         while not done:
-            # 填流水线：在途帧数保持在 worker 数的 2 倍，防止 worker 空转
-            while in_flight < 2 * pool.n:
+            # 填流水线：在途帧数保持在 worker 数的 4 倍，吸收取帧/解码波动
+            while in_flight < 4 * pool.n:
                 try:
                     idx, total, payload = next(it)
                 except StopIteration:
@@ -710,10 +915,11 @@ def decode_frames_parallel(frame_iter, rb, progress_cb):
                     done = True
                     break
     finally:
-        try:
-            frame_iter.close()
-        except Exception:
-            pass
+        if frame_iter is not None:
+            try:
+                frame_iter.close()
+            except Exception:
+                pass
         pool.shutdown()
         _ACTIVE_POOL_PIDS = []
 
@@ -867,7 +1073,8 @@ class RootWidget(BoxLayout):
         self._last_beat = 0.0        # 最近一次帧进展时间
         self._max_gap = 0.0          # 相邻帧最大间隔（锁屏被冻结的证据）
         self._wl_check_t = 0.0       # 唤醒锁自检节流
-        self._power_note = ''        # 常亮/唤醒锁状态（界面显示）
+        self._keep_note = ''         # 屏幕常亮状态（主线程更新）
+        self._wl_note = ''           # 唤醒锁状态（worker 线程更新）
         self._cpu = CpuMeter()
         Clock.schedule_interval(self._refresh_stats, 0.5)
 
@@ -988,21 +1195,34 @@ class RootWidget(BoxLayout):
         return _bind
 
     def _apply_power(self, decoding):
-        """解码期间按设置加/释放：屏幕常亮 + 唤醒锁。
+        """解码期间按设置加/释放：屏幕常亮 + 唤醒锁（状态供界面显示）。
 
-        返回状态描述字符串（显示在界面上，拿锁失败不再静默）。
+        常亮是 UI 相关调用，调度到主线程执行——worker 线程直调
+        Window.addFlags 在部分 ROM 上会失败（v1.2 真机实测"常亮设置失败"）。
         """
         s = self._settings
-        notes = []
         if s.get('keep_on', True):
-            notes.append('屏幕常亮' if _keep_screen_on(decoding) else '常亮设置失败')
+            Clock.schedule_once(lambda dt: self._do_keep_screen(decoding))
+        elif not decoding:
+            self._keep_note = ''
         if s.get('wakelock', False):
             if decoding:
                 ok, err = self._wakelock.acquire()
-                notes.append('唤醒锁已持有' if ok else '唤醒锁失败(%s)' % (err or '未知'))
+                self._wl_note = ('唤醒锁已持有' if ok
+                                 else '唤醒锁失败(%s)' % (err or '未知'))
             else:
                 self._wakelock.release()
-        return ' ｜ '.join(notes)
+                self._wl_note = ''
+
+    def _do_keep_screen(self, enable):
+        """主线程执行常亮设置（Kivy 主线程 = Android UI 线程）。"""
+        ok, err = _keep_screen_on(enable)
+        if not enable:
+            self._keep_note = ''
+        elif ok:
+            self._keep_note = '屏幕常亮已开启'
+        else:
+            self._keep_note = '常亮失败(%s)' % err
 
     def _decode_worker(self, path):
         Clock.schedule_once(lambda dt: self._set_status(
@@ -1024,12 +1244,12 @@ class RootWidget(BoxLayout):
         self._wl_check_t = 0.0
         self._cpu = CpuMeter()
         self._cpu.sample()
-        self._power_note = self._apply_power(True)
+        self._apply_power(True)
         try:
             used_parallel = False
             if self._settings.get('parallel', True):
                 try:
-                    decode_frames_parallel(make_iter(), rb, progress)
+                    decode_frames_parallel(make_iter, rb, progress)
                     used_parallel = True
                 except Exception:
                     import traceback
@@ -1037,7 +1257,7 @@ class RootWidget(BoxLayout):
                     Clock.schedule_once(lambda dt: self._set_status(
                         '并行解码不可用，回退单线程…', CLR_SUB))
             if not used_parallel:
-                decode_frames_sequential(make_iter(), rb, progress)
+                decode_frames_sequential(make_iter, rb, progress)
 
             if not rb.is_done():
                 got, total = rb.progress()
@@ -1070,22 +1290,30 @@ class RootWidget(BoxLayout):
             self._wl_check_t = now
             if not self._wakelock.held():
                 ok, err = self._wakelock.acquire()
-                self._power_note = ('唤醒锁已持有' if ok
-                                    else '唤醒锁失败(%s)' % (err or '未知'))
+                self._wl_note = ('唤醒锁已持有' if ok
+                                 else '唤醒锁失败(%s)' % (err or '未知'))
 
     def _refresh_stats(self, dt):
-        """主线程定时器（0.5s）：解码中刷新进度条与 CPU / 停顿 / 电源状态。"""
+        """主线程定时器（0.5s）：解码中刷新进度条与 CPU / 速率 / 电源状态。"""
         if not self._busy:
             return
         self._cpu.sample()
         i, n = self._prog
         if isinstance(n, int) and n > 0:
             self.progress.value = min(100, i * 100 // n)
-        line2 = 'CPU 约 %.1f 核 / 共 %d 核 ｜ 最长帧间隔 %.1fs' % (
-            self._cpu.cur, self._cpu.cores, self._max_gap)
-        if self._power_note:
-            line2 += ' ｜ ' + self._power_note
-        self._set_status('解码中… 帧 %s / %s\n%s' % (i, n, line2), CLR_TEXT)
+        cores = self._cpu.cores or 1
+        pct = self._cpu.cur * 100.0 / cores
+        rate = ''
+        if self._t_start and i:
+            el = time.monotonic() - self._t_start
+            if el > 0.5:
+                rate = '（%.1f 帧/秒）' % (i / el)
+        line2 = 'CPU %.0f%%（%.1f / %d 核）｜ 最长帧间隔 %.1fs' % (
+            pct, self._cpu.cur, cores, self._max_gap)
+        extra = [x for x in (self._keep_note, self._wl_note) if x]
+        if extra:
+            line2 += ' ｜ ' + ' ｜ '.join(extra)
+        self._set_status('解码中… 帧 %s / %s%s\n%s' % (i, n, rate, line2), CLR_TEXT)
 
     def _save(self, data, name):
         """保存到公共「下载/QRDecode」目录（MediaStore，Android 10+）。
@@ -1135,7 +1363,10 @@ class RootWidget(BoxLayout):
         self._last_path = where
         self.btn_open.disabled = False
         dur = (time.monotonic() - self._t_start) if self._t_start else 0.0
-        extra = '用时 %.1fs ｜ 平均 CPU 约 %.1f 核' % (dur, self._cpu.avg())
+        cores = self._cpu.cores or 1
+        avg = self._cpu.avg()
+        extra = '用时 %.1fs ｜ 平均 CPU %.0f%%（%.1f / %d 核）' % (
+            dur, avg * 100.0 / cores, avg, cores)
         if self._max_gap > 1.0:
             extra += ' ｜ 最长帧间隔 %.1fs' % self._max_gap
         self._set_status('还原成功：%s\n保存位置：%s\n%s' % (name, where, extra),
