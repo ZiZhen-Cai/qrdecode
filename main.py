@@ -65,12 +65,6 @@ _META_FRAME_COUNT = 32
 _MAX_SIDE = 1280
 # 并行解码 worker 数上限（fork 子进程，真正吃满多核；失败自动回退单线程）
 _MAX_WORKERS = 4
-# 视频取帧线程数（各自独立 MediaMetadataRetriever 实例，pyjnius 调 Java
-# 期间释放 GIL，可真正并行；该 API 非线程安全，标准做法是每线程独立实例）
-_FEED_THREADS = 2
-# 视频批量取帧数：getFramesAtIndex 一次取 N 连续帧（官方推荐，比逐帧
-# getFrameAtIndex 高效，避免每帧 seek 开销）；N 越大内存占用越高
-_FRAME_BATCH = 6
 
 
 # ==================== 字体 ====================
@@ -152,33 +146,88 @@ def _save_settings(app, d):
         pass
 
 
-def _keep_screen_on(enable):
-    """FLAG_KEEP_SCREEN_ON：解码期间防止自动息屏。
+_UI_RUNNABLES = []   # PythonJavaClass 引用保活（JNI 对象被 GC 会崩）
 
-    返回 (ok, err)。worker 线程直调 Window.addFlags 在部分 ROM 上会失败，
-    故本函数应由主线程调用（见 _do_keep_screen）；
+
+def _short(s, n=40):
+    """异常文本截断（完整异常可达数百字符，会撑爆界面）。"""
+    s = str(s or '')
+    return s if len(s) <= n else s[:n] + '…'
+
+
+def _post_to_ui_thread(fn):
+    """把可调用对象投递到 Android UI 线程执行。
+
+    关键：Kivy 的主循环跑在 p4a 的 SDL 线程上，**不是** Android UI 线程；
+    Window 属性变更（addFlags/setKeepScreenOn）必须在 UI 线程执行，
+    否则抛 ViewRootImpl$CalledFromWrongThreadException（v1.2/v1.3 真机实测）。
+    """
+    try:
+        from jnius import autoclass, PythonJavaClass, java_method
+
+        class _UiRunnable(PythonJavaClass):
+            __javainterfaces__ = ['java/lang/Runnable']
+
+            @java_method('()V')
+            def run(self):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        activity = autoclass('org.kivy.android.PythonActivity').mActivity
+        r = _UiRunnable()
+        _UI_RUNNABLES.append(r)
+        if len(_UI_RUNNABLES) > 32:
+            del _UI_RUNNABLES[:16]
+        activity.runOnUiThread(r)
+        return True
+    except Exception:
+        return False
+
+
+def _keep_screen_on(enable, on_result=None):
+    """设置屏幕常亮（自动投递到 Android UI 线程执行）。
+
+    on_result(ok, err) 在 UI 线程回调（可选）。
     优先 Window flags，失败退 decorView.setKeepScreenOn 双保险。
     """
-    err1 = ''
-    try:
-        from jnius import autoclass
-        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-        window = PythonActivity.mActivity.getWindow()
-        if enable:
-            window.addFlags(0x00000080)   # WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-        else:
-            window.clearFlags(0x00000080)
-        return True, ''
-    except Exception as e:
-        err1 = str(e)
-    try:
-        from jnius import autoclass
-        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-        view = PythonActivity.mActivity.getWindow().getDecorView()
-        view.setKeepScreenOn(bool(enable))
-        return True, ''
-    except Exception as e2:
-        return False, '%s / %s' % (err1[:70], str(e2)[:70])
+
+    def _apply():
+        ok, err = False, ''
+        try:
+            from jnius import autoclass
+            activity = autoclass('org.kivy.android.PythonActivity').mActivity
+            window = activity.getWindow()
+            if enable:
+                window.addFlags(0x00000080)   # FLAG_KEEP_SCREEN_ON
+            else:
+                window.clearFlags(0x00000080)
+            ok = True
+        except Exception as e:
+            err = str(e)
+        if not ok:
+            try:
+                from jnius import autoclass
+                activity = autoclass('org.kivy.android.PythonActivity').mActivity
+                activity.getWindow().getDecorView().setKeepScreenOn(bool(enable))
+                ok, err = True, ''
+            except Exception as e2:
+                err = '%s / %s' % (err or '?', str(e2))
+        if on_result:
+            try:
+                on_result(ok, err)
+            except Exception:
+                pass
+
+    if not _post_to_ui_thread(_apply):
+        if on_result:
+            try:
+                on_result(False, 'UI 线程投递失败')
+            except Exception:
+                pass
+        return False, 'UI 线程投递失败'
+    return True, ''
 
 
 def _has_wake_lock_permission():
@@ -299,17 +348,53 @@ def _total_cpu_seconds():
     return total
 
 
+def _sys_cpu_snapshot():
+    """读 /proc/stat 第一行 cpu 汇总 → (总 jiffies, 空闲 jiffies)。
+
+    注：Android 10+ 起 /proc/stat 被 SELinux 对第三方 App 屏蔽，
+    非 root 通常读不到，返回 None（由界面降级展示）。
+    """
+    try:
+        with open('/proc/stat', 'rb') as f:
+            parts = f.readline().decode('ascii', 'ignore').split()
+        if not parts or parts[0] != 'cpu' or len(parts) < 5:
+            return None
+        vals = [int(x) for x in parts[1:9]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)   # idle + iowait
+        return sum(vals), idle
+    except Exception:
+        return None
+
+
+def _sys_loadavg():
+    """读 /proc/loadavg 的 1 分钟负载（部分设备可读）。不可读返回 None。"""
+    try:
+        with open('/proc/loadavg', 'rb') as f:
+            return float(f.read().decode('ascii', 'ignore').split()[0])
+    except Exception:
+        return None
+
+
 class CpuMeter(object):
-    """CPU 占用采样器：cur/peak 单位是「等效核数」。"""
+    """CPU 占用采样器：cur/peak 单位是「等效核数」。
+
+    同时尽力采集系统级数据（Android 权限受限时自动为 None）：
+    sys_pct 系统整体 CPU%（/proc/stat 差分）；sys_load 系统 1 分钟负载。
+    """
 
     def __init__(self):
         self.cores = _cpu_cores()
         self.cur = 0.0
         self.peak = 0.0
+        self.sys_pct = None     # 系统整体 CPU %（读得到 /proc/stat 时）
+        self.sys_load = None    # 系统 1 分钟负载（读得到 /proc/loadavg 时）
+        self.sys_ok = False     # /proc/stat 是否可读（决定界面展示口径）
         self._t = None
         self._cpu = None
         self._sum_cpu = 0.0
         self._sum_t = 0.0
+        self._st = None         # /proc/stat 上次快照
+        self._si = None
 
     def sample(self):
         t = time.monotonic()
@@ -325,6 +410,18 @@ class CpuMeter(object):
                 self._sum_t += dt
         self._t = t
         self._cpu = cpu
+        # 系统级（尽力而为）
+        snap = _sys_cpu_snapshot()
+        if snap is not None:
+            self.sys_ok = True
+            if self._st is not None:
+                dt2 = snap[0] - self._st
+                di = snap[1] - self._si
+                if dt2 > 0:
+                    self.sys_pct = max(0.0, min(100.0,
+                                                (1.0 - di / float(dt2)) * 100.0))
+            self._st, self._si = snap
+        self.sys_load = _sys_loadavg()
 
     def avg(self):
         return (self._sum_cpu / self._sum_t) if self._sum_t > 0 else 0.0
@@ -536,62 +633,48 @@ def _bitmap_to_payload(bmp, path, state):
 def iter_video_frames(path):
     """逐帧产出视频帧（'jpg' 负载）。
 
-    - 帧数可用时：多线程 + 批量取帧（见 _iter_video_frames_batched），
-      每个取帧线程持有独立 MediaMetadataRetriever 实例
-      （该 API 非线程安全，标准做法是每线程独立实例；pyjnius 调用 Java
-      期间释放 GIL，可真正并行）。
-    - 帧数不可用时：单线程按时间步进取帧（getFrameAtTime OPTION_CLOSEST）。
+    - 帧数可用时逐帧 getFrameAtIndex（API 28+）；退化用
+      getFrameAtTime(t, 3=OPTION_CLOSEST)（注意 option=2 是 CLOSEST_SYNC，
+      只返回关键帧，会大量漏帧）。
     - Bitmap → Java 侧降采样 → 内存 JPEG（pyjnius 把 byte[] 转 Python bytes），
       不落临时文件；转换不可用的机型自动退回临时文件。
+    - 说明：v1.3 曾改成「多线程 + getFramesAtIndex 批量取帧」，真机实测反而
+      更慢（多个 MMR 解码会话争抢解码器资源），v1.4 回滚为单线程逐帧。
     """
-    from jnius import autoclass
-    MMR = autoclass('android.media.MediaMetadataRetriever')
-    probe = MMR()
-    probe.setDataSource(path)
-    frame_count = 0
-    duration_ms = 0
-    try:
-        try:
-            v = probe.extractMetadata(_META_FRAME_COUNT)
-            if v:
-                frame_count = int(v)
-        except Exception:
-            frame_count = 0
-        if not frame_count:
-            try:
-                duration_ms = int(probe.extractMetadata(_META_DURATION) or 0)
-            except Exception:
-                duration_ms = 0
-    finally:
-        try:
-            probe.release()
-        except Exception:
-            pass
-
-    if frame_count > 0:
-        yield from _iter_video_frames_batched(path, frame_count)
-    else:
-        yield from _iter_video_frames_by_time(path, duration_ms)
-
-
-def _iter_video_frames_by_time(path, duration_ms):
-    """帧数不可用时的退化路径：单线程按时间步进（OPTION_CLOSEST=3）。"""
     from jnius import autoclass
     MMR = autoclass('android.media.MediaMetadataRetriever')
     mmr = MMR()
     mmr.setDataSource(path)
     state = {'mem_ok': True, 'tmp': None}
-    step_ms = 100
-    total = max(1, duration_ms // step_ms)
-    i = 0
     try:
-        while i < total:
+        frame_count = 0
+        try:
+            v = mmr.extractMetadata(_META_FRAME_COUNT)
+            if v:
+                frame_count = int(v)
+        except Exception:
+            frame_count = 0
+        if frame_count > 0:
+            for i in range(frame_count):
+                try:
+                    bmp = mmr.getFrameAtIndex(i)
+                except Exception:
+                    bmp = None
+                yield i + 1, frame_count, _bitmap_to_payload(bmp, path, state)
+        else:
+            duration_ms = 0
             try:
-                bmp = mmr.getFrameAtTime(i * step_ms * 1000, 3)
+                duration_ms = int(mmr.extractMetadata(_META_DURATION) or 0)
             except Exception:
-                bmp = None
-            yield i + 1, total, _bitmap_to_payload(bmp, path, state)
-            i += 1
+                pass
+            step_ms = 100
+            total = max(1, duration_ms // step_ms)
+            for i in range(total):
+                try:
+                    bmp = mmr.getFrameAtTime(i * step_ms * 1000, 3)
+                except Exception:
+                    bmp = None
+                yield i + 1, total, _bitmap_to_payload(bmp, path, state)
     finally:
         try:
             mmr.release()
@@ -604,126 +687,6 @@ def _iter_video_frames_by_time(path, duration_ms):
             except Exception:
                 pass
 
-
-def _q_put(q, item, stop):
-    """带 stop 感知的队列投递：队列满（背压）时也能及时响应停止。"""
-    while not stop.is_set():
-        try:
-            q.put(item, timeout=0.5)
-            return
-        except Exception:
-            pass
-
-
-def _iter_video_frames_batched(path, total, threads=_FEED_THREADS, batch=_FRAME_BATCH):
-    """多线程批量取帧：每线程独立 MMR 实例 + getFramesAtIndex 连续批量解码。
-
-    - getFramesAtIndex 为官方推荐（连续多帧批量取比逐帧 getFrameAtIndex 高效，
-      避免每帧 seek / 解码器初始化开销）；批量调用失败自动退回逐帧。
-    - 产出经有界队列（maxsize=24）汇总——天然背压，防内存堆积。
-    - 任一取帧线程异常 → '__error__' 哨兵上抛，调用方回退单线程全量重解。
-    """
-    import queue as _queue
-    from jnius import autoclass
-    MMR = autoclass('android.media.MediaMetadataRetriever')
-
-    q = _queue.Queue(maxsize=24)
-    stop = threading.Event()
-    n_threads = max(1, min(int(threads), 4))
-
-    def _feed(seg_start, seg_end):
-        state = {'mem_ok': True, 'tmp': None}
-        mmr = None
-        try:
-            mmr = MMR()
-            mmr.setDataSource(path)
-            i = seg_start
-            while i < seg_end and not stop.is_set():
-                n = min(batch, seg_end - i)
-                frames = None
-                try:
-                    frames = mmr.getFramesAtIndex(i, n)
-                except Exception:
-                    frames = None
-                if frames is not None:
-                    cnt = n
-                    try:
-                        cnt = int(frames.size())
-                    except Exception:
-                        pass
-                    k = 0
-                    while k < cnt and not stop.is_set():
-                        bmp = None
-                        try:
-                            bmp = frames.get(k)
-                        except Exception:
-                            pass
-                        _q_put(q, (i + k + 1, total,
-                                   _bitmap_to_payload(bmp, path, state)), stop)
-                        k += 1
-                else:
-                    for k in range(n):
-                        if stop.is_set():
-                            break
-                        bmp = None
-                        try:
-                            bmp = mmr.getFrameAtIndex(i + k)
-                        except Exception:
-                            pass
-                        _q_put(q, (i + k + 1, total,
-                                   _bitmap_to_payload(bmp, path, state)), stop)
-                i += n
-        except Exception as e:
-            try:
-                q.put(('__error__', str(e)), timeout=5)
-            except Exception:
-                pass
-        finally:
-            try:
-                if mmr is not None:
-                    mmr.release()
-            except Exception:
-                pass
-            if state.get('tmp'):
-                try:
-                    if os.path.exists(state['tmp']):
-                        os.remove(state['tmp'])
-                except Exception:
-                    pass
-            try:
-                q.put(('__thread_done__', None), timeout=5)
-            except Exception:
-                pass
-
-    started = 0
-    feed_ts = []
-    for t in range(n_threads):
-        a = t * total // n_threads
-        b = (t + 1) * total // n_threads
-        if a >= b:
-            continue
-        th = threading.Thread(target=_feed, args=(a, b), daemon=True)
-        th.start()
-        feed_ts.append(th)
-        started += 1
-
-    pending = started
-    try:
-        while pending > 0:
-            item = q.get()
-            if item[0] == '__thread_done__':
-                pending -= 1
-                continue
-            if item[0] == '__error__':
-                raise RuntimeError('视频取帧失败: %s' % item[1])
-            yield item
-    finally:
-        stop.set()
-        for th in feed_ts:
-            try:
-                th.join(timeout=0.2)
-            except Exception:
-                pass
 
 
 # ==================== 解码驱动（单线程 / 并行） ====================
@@ -1010,7 +973,7 @@ class RootWidget(BoxLayout):
         self.btn_pick.bind(on_press=self.pick_file)
         self.add_widget(self.btn_pick)
 
-        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(150),
+        status_card = Card(orientation='vertical', size_hint_y=None, height=dp(160),
                            padding=dp(14), spacing=dp(10))
         self.status = Label(text='等待选择文件…', color=CLR_TEXT,
                             font_size=dp(14), halign='left', valign='top')
@@ -1195,34 +1158,36 @@ class RootWidget(BoxLayout):
         return _bind
 
     def _apply_power(self, decoding):
-        """解码期间按设置加/释放：屏幕常亮 + 唤醒锁（状态供界面显示）。
-
-        常亮是 UI 相关调用，调度到主线程执行——worker 线程直调
-        Window.addFlags 在部分 ROM 上会失败（v1.2 真机实测"常亮设置失败"）。
-        """
+        """解码期间按设置加/释放：屏幕常亮（投递 UI 线程）+ 唤醒锁。"""
         s = self._settings
         if s.get('keep_on', True):
-            Clock.schedule_once(lambda dt: self._do_keep_screen(decoding))
+            self._do_keep_screen(decoding)
         elif not decoding:
             self._keep_note = ''
         if s.get('wakelock', False):
             if decoding:
                 ok, err = self._wakelock.acquire()
                 self._wl_note = ('唤醒锁已持有' if ok
-                                 else '唤醒锁失败(%s)' % (err or '未知'))
+                                 else '唤醒锁失败(%s)' % _short(err or '未知'))
             else:
                 self._wakelock.release()
                 self._wl_note = ''
 
     def _do_keep_screen(self, enable):
-        """主线程执行常亮设置（Kivy 主线程 = Android UI 线程）。"""
-        ok, err = _keep_screen_on(enable)
-        if not enable:
-            self._keep_note = ''
-        elif ok:
-            self._keep_note = '屏幕常亮已开启'
-        else:
-            self._keep_note = '常亮失败(%s)' % err
+        """常亮设置：自动投递到 Android UI 线程，执行结果回调更新状态。
+
+        注意：Kivy 主线程 ≠ Android UI 线程（p4a 的 Python 跑在 SDL 线程），
+        必须经 runOnUiThread 投递，否则抛 CalledFromWrongThreadException
+        （v1.2/v1.3 真机实测）。
+        """
+        def _cb(ok, err):
+            if not enable:
+                self._keep_note = ''
+            elif ok:
+                self._keep_note = '屏幕常亮已开启'
+            else:
+                self._keep_note = '常亮失败(%s)' % _short(err)
+        _keep_screen_on(enable, _cb)
 
     def _decode_worker(self, path):
         Clock.schedule_once(lambda dt: self._set_status(
@@ -1278,6 +1243,10 @@ class RootWidget(BoxLayout):
 
     def _update(self, i, n):
         """worker 线程每条帧进展回调：只写共享数据，界面由 _refresh_stats 定时刷新。"""
+        oi, on = self._prog
+        if (isinstance(i, int) and isinstance(oi, int)
+                and i < oi and n == on):
+            i = oi   # 进度只增不减（并行回退等场景也不会让进度条倒退）
         self._prog = (i, n)
         now = time.monotonic()
         if self._last_beat > 0:
@@ -1299,21 +1268,30 @@ class RootWidget(BoxLayout):
             return
         self._cpu.sample()
         i, n = self._prog
-        if isinstance(n, int) and n > 0:
+        if isinstance(n, int) and n > 0 and isinstance(i, int):
             self.progress.value = min(100, i * 100 // n)
         cores = self._cpu.cores or 1
-        pct = self._cpu.cur * 100.0 / cores
         rate = ''
-        if self._t_start and i:
+        if self._t_start and isinstance(i, int) and i:
             el = time.monotonic() - self._t_start
             if el > 0.5:
                 rate = '（%.1f 帧/秒）' % (i / el)
-        line2 = 'CPU %.0f%%（%.1f / %d 核）｜ 最长帧间隔 %.1fs' % (
-            pct, self._cpu.cur, cores, self._max_gap)
+        line2 = '应用CPU %.0f%%（%.1f/%d核）' % (
+            self._cpu.cur * 100.0 / cores, self._cpu.cur, cores)
+        if self._cpu.sys_pct is not None:
+            line2 += ' ｜ 系统CPU %.0f%%' % self._cpu.sys_pct
+        elif self._cpu.sys_ok:
+            line2 += ' ｜ 系统CPU …'      # /proc/stat 可读，首次差分未就绪
+        elif self._cpu.sys_load is not None:
+            line2 += ' ｜ 系统负载 %.1f' % self._cpu.sys_load
+        else:
+            line2 += ' ｜ 系统CPU受限'   # Android 10+ SELinux 屏蔽 /proc/stat
+        line2 += ' ｜ 停顿%.1fs' % self._max_gap
+        text = '解码中… 帧 %s / %s%s\n%s' % (i, n, rate, line2)
         extra = [x for x in (self._keep_note, self._wl_note) if x]
         if extra:
-            line2 += ' ｜ ' + ' ｜ '.join(extra)
-        self._set_status('解码中… 帧 %s / %s%s\n%s' % (i, n, rate, line2), CLR_TEXT)
+            text += '\n' + ' ｜ '.join(extra)
+        self._set_status(text, CLR_TEXT)
 
     def _save(self, data, name):
         """保存到公共「下载/QRDecode」目录（MediaStore，Android 10+）。
@@ -1365,10 +1343,10 @@ class RootWidget(BoxLayout):
         dur = (time.monotonic() - self._t_start) if self._t_start else 0.0
         cores = self._cpu.cores or 1
         avg = self._cpu.avg()
-        extra = '用时 %.1fs ｜ 平均 CPU %.0f%%（%.1f / %d 核）' % (
+        extra = '用时 %.1fs ｜ 平均应用CPU %.0f%%（%.1f/%d核）' % (
             dur, avg * 100.0 / cores, avg, cores)
         if self._max_gap > 1.0:
-            extra += ' ｜ 最长帧间隔 %.1fs' % self._max_gap
+            extra += ' ｜ 最长停顿 %.1fs' % self._max_gap
         self._set_status('还原成功：%s\n保存位置：%s\n%s' % (name, where, extra),
                          CLR_OK)
 
